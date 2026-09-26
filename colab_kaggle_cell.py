@@ -48,6 +48,73 @@ def install(module, package):
     if importlib.util.find_spec(module) is None:
         run([sys.executable, '-m', 'pip', 'install', '-q', package])
 
+def read_gguf_identity(path):
+    """Read GGUF metadata and tensor dimensions without interpreting quant types.
+
+    Some official Bonsai tensor types are extensions unknown to the installed
+    gguf-python enum. Quantization is irrelevant to identity/parameter checks,
+    so parse the standard GGUF descriptors and treat the type field as opaque.
+    """
+    import struct
+    with open(path, 'rb') as f:
+        def exact(n):
+            b = f.read(n)
+            if len(b) != n:
+                raise ValueError('truncated GGUF header')
+            return b
+        def unpack(fmt):
+            return struct.unpack('<' + fmt, exact(struct.calcsize('<' + fmt)))
+        def string():
+            n, = unpack('Q')
+            if n > 1_000_000:
+                raise ValueError('implausible GGUF string length')
+            return exact(n).decode('utf-8', errors='replace')
+        def scalar(t):
+            formats = {0:'B', 1:'b', 2:'H', 3:'h', 4:'I', 5:'i', 6:'f',
+                       7:'B', 10:'Q', 11:'q', 12:'d'}
+            if t == 8:
+                return string()
+            if t not in formats:
+                raise ValueError(f'unsupported GGUF metadata value type {t}')
+            value, = unpack(formats[t])
+            return bool(value) if t == 7 else value
+        magic = exact(4)
+        if magic != b'GGUF':
+            raise ValueError('invalid GGUF magic')
+        version, = unpack('I')
+        if version not in (2, 3):
+            raise ValueError(f'unsupported GGUF version {version}')
+        tensor_count, metadata_count = unpack('QQ')
+        if tensor_count > 10_000_000 or metadata_count > 1_000_000:
+            raise ValueError('implausible GGUF descriptor counts')
+        metadata = {}
+        for _ in range(metadata_count):
+            key = string()
+            kind, = unpack('I')
+            if kind == 9:
+                element_type, = unpack('I')
+                count, = unpack('Q')
+                if count > 100_000_000:
+                    raise ValueError('implausible GGUF metadata array length')
+                value = [scalar(element_type) for _ in range(count)]
+            else:
+                value = scalar(kind)
+            metadata[key] = value
+        params = 0
+        for _ in range(tensor_count):
+            string()  # tensor name
+            n_dims, = unpack('I')
+            if n_dims > 8:
+                raise ValueError('implausible GGUF tensor rank')
+            dims = unpack('Q' * n_dims) if n_dims else ()
+            unpack('I')  # quantization type: intentionally opaque
+            unpack('Q')  # data offset
+            count = 1
+            for dim in dims:
+                count *= dim
+            params += count
+        return metadata, params
+
 def http(url, key=None, body=None, timeout=60):
     headers = {'Content-Type': 'application/json'}
     if key:
@@ -254,9 +321,7 @@ try:
     FILE = f'Ternary-Bonsai-2-27B-{band}.gguf'
     log(f'Packing selected for this hardware: {band} ({FILE})')
     install('huggingface_hub', 'huggingface_hub[hf_xet]')
-    install('gguf', 'gguf')
     from huggingface_hub import HfApi, hf_hub_download
-    from gguf import GGUFReader
     token = os.environ.get('HF_TOKEN') or os.environ.get('BONSAI_TOKEN')
     try:
         info = HfApi().model_info(REPO, files_metadata=True)
@@ -283,18 +348,9 @@ try:
         sha_state = 'PASS (official HF SHA-256)'
     else:
         sha_state = 'unavailable from HF metadata (exact size verified)'
-    reader = GGUFReader(str(model), mode='r')
-    def field(name):
-        f = reader.get_field(name)
-        if f is None:
-            return ''
-        try:
-            return bytes(f.parts[-1]).decode('utf-8', errors='replace')
-        except Exception:
-            return ''
-    meta = {k: field(k) for k in ('general.name', 'general.architecture', 'general.size_label', 'general.file_type')}
-    from math import prod as _prod
-    params = sum(int(_prod(map(int, t.shape))) for t in reader.tensors.values())
+    raw_meta, params = read_gguf_identity(model)
+    meta = {k: str(raw_meta.get(k, '')) for k in
+            ('general.name', 'general.architecture', 'general.size_label', 'general.file_type')}
     name_ok = 'bonsai' in meta['general.name'].lower()
     arch_ok = meta['general.architecture'].lower().startswith('qwen3') or 'bonsai' in meta['general.architecture'].lower()
     size_ok = 23e9 <= params <= 31e9
@@ -307,7 +363,6 @@ try:
     ensure(name_ok and arch_ok and size_ok,
            f'GGUF metadata does not identify Ternary Bonsai 2 27B ({meta}, {params/1e9:.2f}B). Aborting — no substitution.')
     log('Integrity: PASS')
-    del reader
 
     # ------------------------------------------------------------------
     phase(5, 'Selecting optimized configuration')

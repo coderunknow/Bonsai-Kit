@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0 — 2026-09-26
+
+### Fixed
+- GGUF verification no longer depends on `gguf-python` recognizing every tensor
+  quantization enum. Bonsai's official GGUF uses an extended quantization type
+  (including type 142); the deployment now reads standard GGUF metadata and tensor
+  dimensions while treating quantization type IDs as opaque, preserving the integrity
+  and parameter-count checks without rejecting valid official weights.
+
 ## v0.1.0 — 2026-09-26
 
 First tagged release of the single-cell Ternary Bonsai 2 27B deployment.
