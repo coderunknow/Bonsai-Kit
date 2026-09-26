@@ -44,6 +44,47 @@ effort is `medium` for interactive coding latency, and a request can ask for str
 effort via `reasoning_effort`. Sampling defaults follow the official model card
 (`temp 1.0, top_p 0.95, top_k 20, min_p 0.05`).
 
+## Chat client — [`bonsai_chat.py`](bonsai_chat.py)
+
+The cell gives you an API; this is a client worth sitting in front of it. One file,
+**standard library only** (no `pip install`), and `pillow` / `pygments` / `pytesseract` are
+used automatically when they happen to be installed.
+
+```bash
+export BONSAI_BASE_URL=https://<tunnel-host>/v1     # printed by the cell
+export BONSAI_API_KEY=<key>                          # printed once by the cell
+
+python3 bonsai_chat.py --doctor   # is this endpoint actually usable? (health → tools → vision)
+python3 bonsai_chat.py            # interactive chat loop
+python3 bonsai_chat.py -p "Explain why C++ can be fast in 3 sentences."
+cat error.log | python3 bonsai_chat.py -p "what is wrong here?"
+python3 bonsai_chat.py --image diagram.png -p "describe what this measures"
+```
+
+| Feature | What it does |
+| --- | --- |
+| Chat loop | Multi-turn history, `/undo`, `/retry`, `/reset`, autosave to JSONL, Markdown export, Ctrl-C cancels only the current turn |
+| Streaming | Token-by-token output; the model's `reasoning_content` (thinking) is shown in a separate dim block; per-turn tokens, tok/s and TTFT from the server's own timings |
+| Markdown | Headings, nested/task lists, blockquotes, GFM tables and fenced code rendered in the terminal (Pygments highlighting when installed); plain text when piped |
+| Tools | Sandboxed `read_file`, `list_dir`, `search_text`, `write_file`, `run_shell`, `http_get`, `calculator`, `current_time`, `image_inspect`; parallel calls, tool-result loop, `y/n/always` approval for anything that writes or executes |
+| Images | `/image path` (or `--image`). With a vision projector the pixels are sent; on the default text-only deployment the client measures the file instead — format, dimensions, aspect, Pillow colour stats, optional OCR — and sends those facts |
+| Context | Real token counts from `/tokenize`, budgeted trimming that drops whole turns and never orphans a `tool` message from its `tool_calls` |
+| Resilience | Retries on 429/5xx and socket drops, drops `reasoning_effort`/`tools` if the build rejects them, explains a dead Quick Tunnel instead of dumping a traceback |
+
+`/help` lists every command. Two honest limits: the served model is **text-only** (no
+`mmproj`), so an attached image is never *seen* unless you deploy with a vision projector —
+the client says so in the message it sends; and `run_shell`/`write_file`/`http_get` are
+gated behind an approval prompt unless you pass `--auto-approve`.
+
+Try it with no deployment at all — `--mock` and `--selftest` run against
+[`mock_bonsai_server.py`](mock_bonsai_server.py), a stub that speaks the same protocol as the
+PrismML llama.cpp fork with **scripted replies** (it is not a model and runs no inference):
+
+```bash
+python3 bonsai_chat.py --mock     # interactive, scripted answers
+python3 bonsai_chat.py --selftest # 20 protocol/behaviour checks
+```
+
 Optional environment variables (read from the notebook environment/secrets):
 
 | Variable | Purpose |
@@ -76,7 +117,21 @@ Optional environment variables (read from the notebook environment/secrets):
 
 `python -m py_compile colab_kaggle_cell.py` checks syntax and
 `python -m unittest -v test_deployment` runs offline rerun regressions without a GPU. A full integration
-run requires a GPU notebook runtime and is not claimed by CI here. Upstream references:
+run requires a GPU notebook runtime and is not claimed by CI here.
+
+The chat client is verified the same way — offline, no GPU, no model:
+
+```bash
+python -m unittest -v test_chat_client   # 82 tests: transport, streaming, tools, images,
+                                         # markdown, history, REPL commands, CLI, --doctor
+python3 bonsai_chat.py --selftest        # 20 end-to-end checks against the protocol stub
+python3 bonsai_chat.py --doctor          # live diagnostics against a real deployment
+```
+
+`test_chat_client` drives the shipped client over real HTTP against
+[`mock_bonsai_server.py`](mock_bonsai_server.py), which answers with scripted content, so
+what is executed is the code that ships. End-to-end inference quality against the real
+27B model still requires a GPU notebook runtime and is not claimed here. Upstream references:
 [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) (source of truth for running these
 models), [model card](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
 [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp),

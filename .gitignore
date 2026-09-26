@@ -4,3 +4,7 @@ models/
 bin/
 state.json
 *.log
+
+# bonsai_chat.py local session artefacts
+bonsai-session.jsonl
+bonsai-session.md
