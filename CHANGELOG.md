@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.1 — 2026-09-26
+
+### Fixed
+- GGUF verification now accepts official HF files with generic `general.name='Hf'` and
+  architecture `qwen35`. Previous logic required `'bonsai'` in `general.name` and rejected
+  the valid official `Ternary-Bonsai-2-27B-PQ2_0.gguf` (7.21 GB, SHA-256
+  3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1) despite passing SHA-256,
+  size, and 26.90B parameter checks. The fix searches all GGUF metadata for `bonsai`,
+  `prism.*`/`hadamard` signals and accepts `27B` + `qwen35`/`qwen3` family when SHA-verified,
+  preserving strict checks for wrong arch/size while not rejecting the official release.
+- Architecture check now accepts `qwen35` and broader `qwen` family prefix (Bonsai 2 is
+  Qwen3.8-27B derived), not just `qwen3` prefix strictness.
+
 ## v0.2.0 — 2026-09-26
 
 ### Fixed
