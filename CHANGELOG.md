@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.3 — 2026-09-26
+
+### Fixed
+- Rerunning a successful notebook deployment no longer fails the initial 9.5 GiB
+  *free* VRAM gate when the previously launched Bonsai server already holds ~9 GiB.
+  Recover the running process before checking capacity; verify executable, model,
+  bind address, alias, key, authenticated API responses and **per-process** GPU
+  residency before reuse. Keep its actual quantization and context instead of
+  selecting a different model based on remaining free memory.
+- Recover a verified server even after a previous run failed before creating
+  `state.json` (e.g. Cloudflare tunnel failure). Persist private, atomic state
+  as soon as inference is live so subsequent retries can reuse it.
+- Do not adopt/kill unrelated GPU processes or silently override a changed
+  `BONSAI_API_KEY`; new deployments still require free VRAM. Require the full
+  initial disk headroom only when downloading a new deployment.
+- Add offline regression tests for low-free-VRAM reruns, missing/stale state,
+  unsafe/unauthenticated/CPU-only processes, duplicate servers, GPU PID memory,
+  and private state persistence. GPU notebook integration is still required to
+  measure full inference end-to-end.
+
+
 ## v0.2.2 — 2026-09-26
 
 ### Fixed

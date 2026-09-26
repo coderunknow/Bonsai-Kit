@@ -19,7 +19,7 @@ No second cell, no manual commands, no config files.
 | 4 | Downloads only the official language-model GGUF (`PQ2_0` demo default, `PTQ1_0` when free VRAM < ~12 GiB) from `prism-ml/Ternary-Bonsai-2-27B-gguf`, then verifies HF SHA-256 + exact size + GGUF metadata (family name, architecture, ~27B parameter count). No vision projector is downloaded for text-only serving |
 | 5 | Benchmarks single-GPU vs dual-GPU **layer split** (never tensor/row split) with real Bonsai 2 requests and selects the measured winner; context tiered conservatively (8K/16K/32K/64K) with automatic OOM retry at half context |
 | 6 | Starts the PrismML `llama-server` OpenAI API on `127.0.0.1` with `--api-key`, verifies GPU residency via VRAM usage |
-| 7 | Real end-to-end tests: `/health`, `/v1/models`, chat completion, streaming, model-name validation, bearer auth, invalid/missing key rejection, native tool calling (`--jinja`). `READY` is printed only if every test passes |
+| 7 | Real end-to-end tests: `/health`, `/v1/models`, chat completion, streaming, model alias reporting, bearer auth, invalid/missing key rejection, native tool calling (`--jinja`). `READY` is printed only if every test passes |
 | 8 | Cloudflare Quick Tunnel exposing only the API port, verified remotely, then prints base URL, API key, benchmark numbers, and client examples |
 
 ## Using the API
@@ -38,7 +38,7 @@ print(response.choices[0].message.content)
 ```
 
 Supported: chat completions (streaming and non-streaming), system messages,
-`max_tokens`, `temperature`, `top_p`, model-name validation, bearer auth, and native
+`max_tokens`, `temperature`, `top_p`, model alias reporting, bearer auth, and native
 tool/function calling. Reasoning (thinking) is **on** by default; the server default
 effort is `medium` for interactive coding latency, and a request can ask for stronger
 effort via `reasoning_effort`. Sampling defaults follow the official model card
@@ -61,6 +61,11 @@ Optional environment variables (read from the notebook environment/secrets):
   live against the running server. `READY` is never printed without passing end-to-end tests.
 - **No speculative decoding** (no official Bonsai 2 drafter exists) and **no vision tower**
   (text-only serving saves VRAM) — both stated explicitly in the output.
+- **Safe reruns.** A rerun reuses only a verified server from this work directory
+  (even if a prior run failed while starting the tunnel). A different running
+  GPU job is never stopped or mistaken for Bonsai; if VRAM is insufficient,
+  stop that job yourself before starting a new deployment. Changing
+  `BONSAI_API_KEY` while a server is live requires stopping the old server first.
 - **Session-scoped.** The API and the ephemeral `trycloudflare.com` URL live only while the
   notebook runtime runs. Single-slot serving is tuned for one coding-agent user with
   prompt-cache reuse; it is not a multi-tenant production service.
@@ -69,7 +74,8 @@ Optional environment variables (read from the notebook environment/secrets):
 
 ## Verification
 
-`python -m py_compile colab_kaggle_cell.py` checks syntax without a GPU. A full integration
+`python -m py_compile colab_kaggle_cell.py` checks syntax and
+`python -m unittest -v test_deployment` runs offline rerun regressions without a GPU. A full integration
 run requires a GPU notebook runtime and is not claimed by CI here. Upstream references:
 [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) (source of truth for running these
 models), [model card](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
