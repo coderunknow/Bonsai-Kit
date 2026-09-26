@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.3.0 — 2026-09-26
+
+### Added
+- **`bonsai_chat.py` — a real chat client for the deployed API** (standard library only;
+  `pillow`, `pygments` and `pytesseract` are used when present and skipped when not):
+  - interactive multi-turn loop with slash commands (`/help`, `/system`, `/undo`, `/retry`,
+    `/reset`, `/image`, `/tools`, `/temp`, `/topp`, `/max-tokens`, `/effort`, `/stream`,
+    `/markdown`, `/vision`, `/context`, `/history`, `/usage`, `/save`, `/load`, `/export`),
+    multi-line input, Ctrl-C that cancels only the current turn, and JSONL session
+    autosave/resume plus Markdown transcript export
+  - streaming with the model's `reasoning_content` rendered as a separate dim block and
+    per-turn tokens / tok/s / TTFT taken from the server's own usage and timings
+  - terminal Markdown rendering: headings, nested and task lists, blockquotes, GFM tables,
+    fenced code (Pygments-highlighted when available), inline styles and links; automatic
+    plain output when stdout is piped, `--plain` / `--color` to override
+  - image handling: PNG/JPEG/GIF/WebP/BMP headers parsed without third-party code,
+    Pillow statistics and optional tesseract OCR when installed, downscaling before upload,
+    and a `modalities`-aware vision check (`/props`) with a 1x1 PNG probe fallback. Pixels are
+    sent only if the server actually has a vision projector; on the default text-only
+    deployment the client sends the measured facts and says so explicitly
+  - tool calling: sandboxed `read_file`, `list_dir`, `search_text`, `write_file`,
+    `run_shell`, `http_get`, `calculator`, `current_time`, `image_inspect`, a decorator for
+    registering your own, parallel tool calls, a bounded tool-result loop, and an
+    approve/deny/always gate for anything that writes or executes
+  - `--doctor` live endpoint diagnostics (health, models, context, auth, chat, streaming,
+    native tool calling, vision) and `--selftest` / `--mock` offline modes
+  - one-shot (`-p`), piped-stdin and `--json` modes for scripting
+- **`mock_bonsai_server.py`** — an offline stub of the PrismML llama.cpp endpoint (SSE with
+  `reasoning_content`, tool-call fragments split across chunks, `/props`, `/tokenize`,
+  `/health`, bearer auth, text-only image rejection). Scripted replies only: it is not a
+  model and runs no inference.
+- **`test_chat_client.py`** — 82 offline tests that drive the shipped client over real HTTP
+  against that stub: transport/retries, SSE parsing, tool loop and approval, sandbox escape
+  refusal, image headers and cards, Markdown rendering, history trimming, REPL commands,
+  CLI modes and `--doctor`.
+- The deployment cell now prints the chat-client quick start next to the curl example.
+
+### Fixed
+- **llama.cpp-native routes were requested under `/v1`**: `/props`, `/tokenize` and
+  `/health` live at the server root (only `/v1/*` is OpenAI-compatible), so context
+  detection and exact token counting silently 404'd and fell back to defaults/heuristics.
+  The client now keeps a separate root URL, matching what `colab_kaggle_cell.py` does for
+  `/health`.
+- Context window and token counts are cached per session; previously every turn re-fetched
+  `/props` and re-tokenized the entire history (one round trip per message per turn).
+- History trimming drops whole turns, so a `tool` message can never be sent without the
+  `tool_calls` it answers — that combination makes llama.cpp reject the request.
+- Attached-image cards were printed twice (once by `/image`, again when the turn was sent).
+
 ## v0.2.4 — 2026-09-26
 
 ### Fixed
