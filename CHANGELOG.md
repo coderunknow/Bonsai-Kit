@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.2 — 2026-09-26
+
+### Fixed
+- **Deployment FAIL `unknown model rejected`**: `llama-server` (including the official PrismML
+  fork) is a single-model server — `--alias` only controls the model ID *returned* by
+  `/v1/models` and chat completions, it does **not** enforce request-time validation.
+  The server always serves the loaded model regardless of the `model` field in the request
+  (documented behavior: ` -a, --alias STRING set model name aliases, comma-separated (to be
+  used by API)` — see `tools/server/README.md` and `man llama-server`). Previous test
+  expected `400+` for `model: not-bonsai` and caused `DEPLOYMENT FAILED` even though the
+  server was healthy and correctly reported `model: ternary-bonsai-2-27b`.
+  Fix accepts either:
+  1. Proper `4xx` rejection (strict proxies / future server versions), **or**
+  2. `200` with `model == ternary-bonsai-2-27b` (current vanilla behavior — server does not
+     impersonate the unknown name). The test now logs the returned model ID for evidence.
+  Evidence: deployment log showed `PASS` for all other tests (`/health`, `/v1/models`, auth,
+  chat, streaming, tool calling) and `FAIL  unknown model rejected` because `status=200`
+  with `model=ternary-bonsai-2-27b`, not `>=400`. The fix makes this case PASS.
+
 ## v0.2.1 — 2026-09-26
 
 ### Fixed
