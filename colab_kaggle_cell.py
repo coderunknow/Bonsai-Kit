@@ -203,6 +203,106 @@ def http(url, key=None, body=None, timeout=60):
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
 
+def gpu_process_memory(pid):
+    """GPU MiB attributed to a process, not to unrelated notebook workloads."""
+    out = run(['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory',
+               '--format=csv,noheader,nounits'], capture_output=True).stdout
+    return sum(int(parts[1].strip()) for line in out.splitlines()
+               if len(parts := line.split(',')) == 2 and parts[0].strip() == str(pid)
+               and parts[1].strip().isdigit())
+
+def require_capacity(free_mib, existing):
+    if not existing:
+        ensure(max(free_mib) >= 9500,
+               f'Insufficient free VRAM (max {max(free_mib)} MiB). Bonsai 2 27B needs '
+               '~9.5 GiB free on one GPU for a new server. If a previous notebook '
+               'server is occupying VRAM, stop it and rerun; unrelated GPU processes '
+               'are never terminated automatically.')
+
+def model_band(free_mib, existing):
+    # The remaining free VRAM after a server starts is not a model-selection signal.
+    if existing:
+        return existing['model'].removeprefix('Ternary-Bonsai-2-27B-').removesuffix('.gguf')
+    return 'PQ2_0' if free_mib[0] >= 12000 else 'PTQ1_0'
+
+def managed_server(root, state, request=http, proc_root=Path('/proc'), gpu_memory=gpu_process_memory):
+    """Recover only a live, authenticated server launched by this cell.
+
+    In particular, free VRAM alone cannot identify an existing deployment: an
+    unrelated process may be using the GPU. /proc lets us recover even when a
+    previous run failed before writing state.json (for example at the tunnel).
+    """
+    binary = root / 'Bonsai-demo/bin/cuda/llama-server'
+    model_dir = root / 'models'
+    candidates = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid() or Path(os.readlink(entry / 'exe')) != binary:
+                continue
+            argv = (entry / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+            if not argv or Path(argv[0]) != binary:
+                continue
+            def arg(flag):
+                i = argv.index(flag)
+                return argv[i + 1]
+            port = int(arg('--port'))
+            key = arg('--api-key')
+            model = Path(arg('-m'))
+            ctx = int(arg('-c'))
+            if (not 1 <= port <= 65535 or not key or ctx < 1 or
+                arg('--host') != '127.0.0.1' or arg('--alias') != ALIAS or
+                arg('-ngl') != '99' or model.parent != model_dir or
+                model.name not in ('Ternary-Bonsai-2-27B-PTQ1_0.gguf',
+                                   'Ternary-Bonsai-2-27B-PQ2_0.gguf')):
+                continue
+            if state.get('server_pid') == int(entry.name):
+                # A stale or tampered state must never cause us to adopt a
+                # different server or silently change a configured API key.
+                if (state.get('key') != key or state.get('port') != port or
+                    state.get('model') != model.name):
+                    continue
+            url = f'http://127.0.0.1:{port}'
+            health, body = request(url + '/health', key, timeout=5)
+            models, listing = request(url + '/v1/models', key, timeout=5)
+            denied, _ = request(url + '/v1/models', None, timeout=5)
+            if (health != 200 or not isinstance(body, dict) or body.get('status') != 'ok'
+                or models != 200 or not isinstance(listing, dict)
+                or not any(m.get('id') == ALIAS for m in listing.get('data', []))
+                or denied not in (401, 403) or gpu_memory(int(entry.name)) < 5000):
+                continue
+            split = 'layer' if '--split-mode' in argv and arg('--split-mode') == 'layer' else 'none'
+            candidates.append(dict(server_pid=int(entry.name), port=port, key=key,
+                                   model=model.name, ctx=ctx, split=split))
+        except (OSError, ValueError, IndexError, UnicodeError):
+            # Processes can exit during inspection; malformed/foreign ones
+            # must never be counted as ours.
+            continue
+    if len(candidates) > 1:
+        raise RuntimeError('Multiple Bonsai servers found in this work directory. '
+                           'Stop the duplicate deployments before rerunning.')
+    if not candidates:
+        return None
+    found = candidates[0]
+    if state.get('server_pid') == found['server_pid']:
+        found.update({k: state[k] for k in ('bench', 'selected') if k in state})
+        if state.get('port') == found['port']:
+            found.update({k: state[k] for k in ('tunnel_pid', 'public') if k in state})
+    return found
+
+def save_state(path, state):
+    """Persist credentials before tunnel setup; never leave a partial state file."""
+    tmp = path.with_name(path.name + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(state, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
 def free_port():
     s = socket.socket()
     s.bind(('127.0.0.1', 0))
@@ -305,7 +405,6 @@ try:
     ram_total, ram_avail = mem_gi('MemTotal:'), mem_gi('MemAvailable:')
     disk_free = shutil.disk_usage(ROOT).free / 1024**3
     log(f'Platform: {plat} | RAM {ram_total:.1f} GiB ({ram_avail:.1f} GiB available) | disk free {disk_free:.1f} GiB')
-    ensure(disk_free >= 11, f'Need ~11 GiB free disk for runtime + model (have {disk_free:.1f} GiB).')
     ensure(ram_total >= 9, f'Need >= 9 GiB system RAM (have {ram_total:.1f} GiB).')
 
     # ------------------------------------------------------------------
@@ -333,11 +432,31 @@ try:
         log(f"GPU {g['index']}: {g['name']} | {int(g['total'])/1024:.1f} GiB total | "
             f"{int(g['free'])/1024:.1f} GiB free | SM {g['cap']} | PCI {g['pci']} | driver {g['driver']}")
     identical = len({g['name'] for g in gpus}) == 1
-    log(f"GPUs identical: {identical} | second GPU usable: "
-        f"{len(gpus) >= 2 and int(gpus[1]['free']) >= 9500 if len(gpus) >= 2 else 'n/a (single GPU)'}")
     free_mib = [int(g['free']) for g in gpus]
-    ensure(max(free_mib) >= 9500,
-           f'Insufficient free VRAM (max {max(free_mib)} MiB). Bonsai 2 27B needs ~9.5 GiB free on one GPU.')
+    state = {}
+    if STATE.exists():
+        try:
+            state = json.loads(STATE.read_text())
+        except (OSError, ValueError):
+            pass
+    if not isinstance(state, dict):
+        state = {}
+    existing = managed_server(ROOT, state)
+    requested_key = os.environ.get('BONSAI_API_KEY') or ''
+    if requested_key:
+        ensure(len(requested_key) >= 32, 'BONSAI_API_KEY must be at least 32 characters.')
+    if existing and requested_key and requested_key != existing['key']:
+        raise RuntimeError('A verified Bonsai server is already running with a different '
+                           'BONSAI_API_KEY. Stop it before changing the key.')
+    log(f"GPUs identical: {identical} | second GPU usable: "
+        f"{len(gpus) >= 2 and free_mib[1] >= 9500 if len(gpus) >= 2 else 'n/a (single GPU)'}")
+    if existing:
+        log(f"Found authenticated Bonsai server (pid {existing['server_pid']}, "
+            f"port {existing['port']}, model {existing['model']}). "
+            'Its allocated VRAM is not available for a second server; reusing it.')
+    require_capacity(free_mib, existing)
+    if not existing:
+        ensure(disk_free >= 11, f'Need ~11 GiB free disk for runtime + model (have {disk_free:.1f} GiB).')
 
     # ------------------------------------------------------------------
     phase(3, 'Preparing PrismML runtime')
@@ -385,7 +504,7 @@ try:
     # Official demo default packing is PQ2_0 (faster prompt processing, CUDA-optimized);
     # PTQ1_0 is the official smaller band for tight VRAM. Both are official files from
     # the same prism-ml release — the weights are never modified, merged or re-quantized.
-    band = 'PQ2_0' if free_mib[0] >= 12000 else 'PTQ1_0'
+    band = model_band(free_mib, existing)
     FILE = f'Ternary-Bonsai-2-27B-{band}.gguf'
     log(f'Packing selected for this hardware: {band} ({FILE})')
     install('huggingface_hub', 'huggingface_hub[hf_xet]')
@@ -483,16 +602,8 @@ try:
         ctx = 16384
     else:
         ctx = 8192
-    key = os.environ.get('BONSAI_API_KEY') or ''
-    if key:
-        ensure(len(key) >= 32, 'BONSAI_API_KEY must be at least 32 characters.')
-    else:
-        try:
-            key = json.loads(STATE.read_text()).get('key') or '' if STATE.exists() else ''
-        except Exception:
-            key = ''
-    if not key:
-        key = secrets.token_urlsafe(32)
+    saved_key = state.get('key')
+    key = existing['key'] if existing else requested_key or (saved_key if isinstance(saved_key, str) and len(saved_key) >= 32 else secrets.token_urlsafe(32))
     fa = supports('-fa', '--flash-attn')
     jinja_on = supports('--jinja')
     args_common = ['-m', str(model), '--alias', ALIAS, '--host', '127.0.0.1', '-ngl', '99']
@@ -592,32 +703,18 @@ try:
         return dict(input=float(inp), output=float(out), ttft=(res['first'] - res['t0']) * 1000,
                     prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'])
 
-    # Idempotency: reuse a healthy server from a previous run of this cell.
-    state = {}
-    if STATE.exists():
-        try:
-            state = json.loads(STATE.read_text())
-        except Exception:
-            state = {}
-    reused = False
-    if state.get('server_pid') and state.get('port') and state.get('key') and state.get('model') == FILE:
-        try:
-            os.kill(state['server_pid'], 0)
-            status, body = http(f'http://127.0.0.1:{state["port"]}/health', state.get('key'), timeout=5)
-            if status == 200 and isinstance(body, dict) and body.get('status') == 'ok':
-                proc, port, key = None, state['port'], state['key']
-                selected = state.get('selected', 'Single GPU (reused)')
-                result = state.get('bench') or benchmark(port)
-                reused = True
-                log(f'Reusing healthy existing server (pid {state["server_pid"]}, port {port}) — no duplicate spawn.')
-        except ProcessLookupError:
-            pass
-        except Exception:
-            pass
+    # The process was verified before the free-VRAM gate, so an existing model
+    # does not get mistaken for an unrelated GPU consumer on notebook reruns.
+    reused = existing is not None
+    if reused:
+        proc, port = None, existing['port']
+        selected = existing.get('selected') or ('Dual GPU layer split (recovered)' if existing['split'] == 'layer' else 'Single GPU (recovered)')
+        result = existing.get('bench') or benchmark(port)
+        log(f"Reusing healthy existing server (pid {existing['server_pid']}, port {port}) — no duplicate spawn.")
 
     cur_ctx = ctx
     if reused:
-        cur_ctx = state.get('ctx', ctx)  # report the context the reused server actually serves
+        cur_ctx = existing['ctx']  # read from the live process, not possibly stale state
     if not reused:
         split_avail = supports('--split-mode')
         single_extra = ['--split-mode', 'none'] if split_avail else []
@@ -678,6 +775,15 @@ try:
         log(f'Inference server live on 127.0.0.1:{port} (pid {proc.pid}).')
     local = f'http://127.0.0.1:{port}'
     chat_url = local + '/v1/chat/completions'
+
+    # Save as soon as the server is ready. If tests or the public tunnel fail,
+    # a rerun can authenticate and reuse it rather than demanding free VRAM.
+    active_state = dict(key=key, port=port, model=FILE, selected=selected,
+                        bench=result, ctx=cur_ctx,
+                        server_pid=existing['server_pid'] if reused else proc.pid)
+    if reused and existing.get('public'):
+        active_state.update(public=existing['public'], tunnel_pid=existing.get('tunnel_pid'))
+    save_state(STATE, active_state)
 
     # ------------------------------------------------------------------
     phase(7, 'Running real API tests')
@@ -799,12 +905,12 @@ try:
         tunnel_bin.chmod(0o700)
     tunnel_proc = None
     public = None
-    if state.get('tunnel_pid') and state.get('public') and state.get('port') == port:
+    if active_state.get('tunnel_pid') and active_state.get('public'):
         try:
-            os.kill(state['tunnel_pid'], 0)
-            status, remote = http(state['public'] + '/v1/models', key, timeout=30)
+            os.kill(active_state['tunnel_pid'], 0)
+            status, remote = http(active_state['public'] + '/v1/models', key, timeout=30)
             if status == 200 and any(m.get('id') == ALIAS for m in remote.get('data', [])):
-                public = state['public']
+                public = active_state['public']
                 log('Reusing existing healthy tunnel.')
         except Exception:
             public = None
@@ -832,12 +938,9 @@ try:
         ensure(rres['chunks'] >= 1, 'No tokens through public tunnel.')
     except Exception as e:
         raise RuntimeError(f'End-to-end chat through public tunnel failed: {e}')
-    STATE.write_text(json.dumps({
-        'key': key, 'port': port, 'model': FILE, 'selected': selected, 'bench': result, 'ctx': cur_ctx,
-        'server_pid': proc.pid if proc is not None else state.get('server_pid'),
-        'tunnel_pid': tunnel_proc.pid if tunnel_proc is not None else state.get('tunnel_pid'),
-        'public': public}))
-    os.chmod(STATE, 0o600)
+    active_state.update(tunnel_pid=tunnel_proc.pid if tunnel_proc is not None else active_state.get('tunnel_pid'),
+                        public=public)
+    save_state(STATE, active_state)
 
     # ------------------------------------------------------------------
     vram_now = [int(r['used']) for r in nvidia_rows()]
