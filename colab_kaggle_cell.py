@@ -48,12 +48,12 @@ def install(module, package):
     if importlib.util.find_spec(module) is None:
         run([sys.executable, '-m', 'pip', 'install', '-q', package])
 
-def read_gguf_identity(path):
-    """Read GGUF metadata and tensor dimensions without interpreting quant types.
+def _parse_gguf_raw(path):
+    """Parse GGUF metadata and tensor descriptors without interpreting custom quant types.
 
-    Some official Bonsai tensor types are extensions unknown to the installed
-    gguf-python enum. Quantization is irrelevant to identity/parameter checks,
-    so parse the standard GGUF descriptors and treat the type field as opaque.
+    Some official Bonsai tensor types are extensions (e.g. PQ2_0 type 142, PTQ1_0 type 143)
+    unknown to standard upstream gguf-py enum. Quantization type is treated as opaque to
+    preserve metadata and ~27B parameter-count integrity checks without crashing.
     """
     import struct
     with open(path, 'rb') as f:
@@ -78,6 +78,7 @@ def read_gguf_identity(path):
                 raise ValueError(f'unsupported GGUF metadata value type {t}')
             value, = unpack(formats[t])
             return bool(value) if t == 7 else value
+
         magic = exact(4)
         if magic != b'GGUF':
             raise ValueError('invalid GGUF magic')
@@ -87,6 +88,7 @@ def read_gguf_identity(path):
         tensor_count, metadata_count = unpack('QQ')
         if tensor_count > 10_000_000 or metadata_count > 1_000_000:
             raise ValueError('implausible GGUF descriptor counts')
+
         metadata = {}
         for _ in range(metadata_count):
             key = string()
@@ -96,24 +98,85 @@ def read_gguf_identity(path):
                 count, = unpack('Q')
                 if count > 100_000_000:
                     raise ValueError('implausible GGUF metadata array length')
-                value = [scalar(element_type) for _ in range(count)]
+                # For very large numeric arrays (e.g. token scores/types with > 2048 items),
+                # seek directly past array bytes to keep verification fast and RAM minimal.
+                if element_type in (0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12) and count > 2048:
+                    sz = {0:1, 1:1, 2:2, 3:2, 4:4, 5:4, 6:4, 7:1, 10:8, 11:8, 12:8}[element_type]
+                    f.seek(count * sz, 1)
+                    value = f'<array of {count} items>'
+                else:
+                    value = [scalar(element_type) for _ in range(count)]
             else:
                 value = scalar(kind)
             metadata[key] = value
+
         params = 0
+        tensor_items = []
         for _ in range(tensor_count):
-            string()  # tensor name
+            tname = string()  # tensor name
             n_dims, = unpack('I')
             if n_dims > 8:
                 raise ValueError('implausible GGUF tensor rank')
             dims = unpack('Q' * n_dims) if n_dims else ()
-            unpack('I')  # quantization type: intentionally opaque
-            unpack('Q')  # data offset
+            ttype, = unpack('I')  # quantization type: intentionally opaque (e.g. 142 PQ2_0, 143 PTQ1_0)
+            toff, = unpack('Q')   # data offset
             count = 1
             for dim in dims:
                 count *= dim
             params += count
-        return metadata, params
+            tensor_items.append((tname, dims, ttype, toff))
+        return metadata, params, tensor_items
+
+def read_gguf_identity(path):
+    """Read GGUF metadata and tensor dimensions without interpreting quant types."""
+    metadata, params, _ = _parse_gguf_raw(path)
+    return metadata, params
+
+class ReaderField:
+    """ReaderField compatibility object for standard GGUFReader consumers."""
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+        if isinstance(value, str):
+            b = value.encode('utf-8')
+        elif isinstance(value, (bytes, bytearray)):
+            b = bytes(value)
+        else:
+            b = str(value).encode('utf-8')
+        self.parts = [b]
+
+    def contents(self):
+        return self.value
+
+    def __str__(self):
+        return str(self.value)
+
+class GGUFTensor:
+    """GGUFTensor descriptor exposing name, shape, tensor_type, offset."""
+    def __init__(self, name, shape, tensor_type=0, offset=0):
+        self.name = name
+        self.shape = shape
+        self.tensor_type = tensor_type
+        self.offset = offset
+
+class _TensorList(list):
+    """List subclass providing a .values() method for dict-like iteration."""
+    def values(self):
+        return self
+
+class GGUFReader:
+    """Drop-in GGUFReader that handles extended/custom quantization types (e.g. 142, 143)."""
+    def __init__(self, path, mode='r'):
+        self.fields = {}
+        self.tensors = _TensorList()
+        raw_meta, self._params, tensor_items = _parse_gguf_raw(path)
+        for k, v in raw_meta.items():
+            self.fields[k] = ReaderField(k, v)
+        for tname, tshape, ttype, toff in tensor_items:
+            self.tensors.append(GGUFTensor(tname, tshape, ttype, toff))
+
+    def get_field(self, name):
+        return self.fields.get(name)
 
 def http(url, key=None, body=None, timeout=60):
     headers = {'Content-Type': 'application/json'}
@@ -221,13 +284,18 @@ def stream_chat(url, key, body, timeout):
 class OomError(RuntimeError):
     pass
 
+ROOT = None
+
 try:
     # ------------------------------------------------------------------
     phase(1, 'Detecting platform')
     ensure(sys.platform == 'linux' and platform.machine() == 'x86_64',
            'Only Linux x86_64 CUDA notebook runtimes are supported.')
     is_kaggle = bool(os.environ.get('KAGGLE_KERNEL_RUN_TYPE'))
-    is_colab = importlib.util.find_spec('google.colab') is not None
+    try:
+        is_colab = importlib.util.find_spec('google.colab') is not None
+    except Exception:
+        is_colab = False
     plat = 'Kaggle' if is_kaggle else 'Colab' if is_colab else 'Linux notebook'
     base_dir = Path('/kaggle/working' if is_kaggle else '/content' if is_colab else tempfile.gettempdir())
     ROOT = base_dir / 'bonsai2-api'
@@ -796,5 +864,6 @@ except Exception as exc:
         hints.append('Rerun; the cell halves context on OOM automatically. Close other GPU consumers.')
     for h in hints:
         log('Hint: ' + h)
-    log('Server/runtime logs: ' + str(ROOT) + ' (server-single.log / server-dual.log / server-final.log / tunnel.log)')
+    if ROOT is not None:
+        log('Server/runtime logs: ' + str(ROOT) + ' (server-single.log / server-dual.log / server-final.log / tunnel.log)')
     raise
