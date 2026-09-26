@@ -126,5 +126,94 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(state_path.with_name('state.json.tmp').exists())
 
 
+class TunnelAndFlagTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.public = 'https://demo.trycloudflare.com'
+        self.key = 'x' * 32
+
+    def test_verify_tunnel_immediate_success(self):
+        req = Mock(return_value=(200, {'data': [{'id': ns['ALIAS']}]}))
+        ok, res = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=2, interval=0.001)
+        self.assertTrue(ok)
+        self.assertEqual(res['data'][0]['id'], ns['ALIAS'])
+        self.assertEqual(req.call_count, 1)
+
+    def test_verify_tunnel_retries_dns_and_502_until_success(self):
+        responses = [
+            (None, 'URLError: <urlopen error [Errno -2] Name or service not known>'),
+            (None, 'URLError: <urlopen error [Errno -2] Name or service not known>'),
+            (502, 'Bad Gateway'),
+            (200, {'data': [{'id': ns['ALIAS']}]}),
+        ]
+        req = Mock(side_effect=responses)
+        ok, res = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=5, interval=0.001)
+        self.assertTrue(ok)
+        self.assertEqual(res['data'][0]['id'], ns['ALIAS'])
+        self.assertEqual(req.call_count, 4)
+
+    def test_verify_tunnel_timeout_returns_failure(self):
+        req = Mock(return_value=(None, 'URLError: <urlopen error [Errno -2] Name or service not known>'))
+        ok, err = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=0.03, interval=0.005)
+        self.assertFalse(ok)
+        self.assertIn('Remote tunnel API verification failed', err)
+        self.assertIn('Name or service not known', err)
+
+    def test_verify_tunnel_stops_if_proc_exits(self):
+        proc = Mock()
+        proc.poll.return_value = 1
+        req = Mock(return_value=(None, 'URLError: error'))
+        ok, err = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=5, interval=0.005, proc=proc)
+        self.assertFalse(ok)
+        self.assertIn('prematurely', err)
+        self.assertIn('code 1', err)
+        self.assertEqual(req.call_count, 0)
+
+    def test_verify_tunnel_stops_with_log_tail_if_proc_exits(self):
+        proc = Mock()
+        proc.poll.return_value = 2
+        log_path = Path(self.temp.name) / 'tunnel.log'
+        log_path.write_text('cloudflared failed: unable to bind edge socket')
+        req = Mock(return_value=(None, 'URLError: error'))
+        ok, err = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=5, interval=0.005,
+                                                   proc=proc, log_path=log_path)
+        self.assertFalse(ok)
+        self.assertIn('prematurely', err)
+        self.assertIn('code 2', err)
+        self.assertIn('unable to bind edge socket', err)
+
+    def test_verify_tunnel_rejects_missing_alias_and_non_dict(self):
+        req = Mock(return_value=(200, {'data': [{'id': 'wrong-model'}]}))
+        ok, err = ns['verify_tunnel_connectivity'](self.public, self.key, request=req, max_wait=0.02, interval=0.005)
+        self.assertFalse(ok)
+
+        req_str = Mock(return_value=(200, '<html>error</html>'))
+        ok, err = ns['verify_tunnel_connectivity'](self.public, self.key, request=req_str, max_wait=0.02, interval=0.005)
+        self.assertFalse(ok)
+
+    def test_parse_supported_flags(self):
+        import warnings
+        helptext = """
+        options:
+          -h, --help            show help
+          -fa, --flash-attn     enable flash attention
+          --chat-template-kwargs JSON
+                                kwargs
+          -c, --ctx-size N      context size
+          --port PORT           port
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            flags = ns['parse_supported_flags'](helptext)
+            self.assertEqual(len(w), 0, "No deprecation warnings should be raised")
+        self.assertIn('-fa', flags)
+        self.assertIn('--flash-attn', flags)
+        self.assertIn('--chat-template-kwargs', flags)
+        self.assertIn('--ctx-size', flags)
+        self.assertIn('-c', flags)
+        self.assertNotIn('--unknown', flags)
+
+
 if __name__ == '__main__':
     unittest.main()
