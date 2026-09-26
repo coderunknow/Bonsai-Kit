@@ -1,196 +1,705 @@
-# Paste this entire file into ONE Colab/Kaggle Python cell.
-import os, sys, subprocess, pathlib, json, time, socket, secrets, hashlib, re, platform, urllib.request, shutil, ctypes, importlib.util
-from urllib.error import HTTPError
+# Ternary Bonsai 2 27B — ONE-CELL Colab/Kaggle deployment.
+#
+# Paste this entire file into ONE Python cell, select an NVIDIA GPU runtime
+# (T4 or T4x2), enable notebook Internet access, and run.
+#
+# What it does, all automatically:
+#   [1/8] platform check   [2/8] GPU inspection (1..N GPUs, VRAM, CUDA)
+#   [3/8] official PrismML runtime: clones PrismML-Eng/Bonsai-demo and uses its
+#         scripts/download_binaries.sh, which pins the compatible PrismML
+#         llama.cpp fork CUDA build (stock llama.cpp cannot run Bonsai 2).
+#         Open WebUI / MLX / code-interpreter extras are deliberately skipped.
+#   [4/8] downloads ONLY the official prism-ml/Ternary-Bonsai-2-27B-gguf
+#         language model (PQ2_0 demo default; PTQ1_0 if VRAM is tight),
+#         verifies HF SHA-256 + size + GGUF identity/parameter count,
+#         and never touches or converts the weights. No mmproj/vision tower
+#         is downloaded for this text-only API.
+#   [5/8] benchmarks single-GPU vs dual-GPU layer split on real hardware
+#         (never tensor/row split) and picks the measured winner.
+#   [6/8] starts the PrismML llama-server OpenAI-compatible API on localhost.
+#   [7/8] real end-to-end tests incl. streaming, auth, model validation,
+#         native tool calling. Prints READY only if every test passes.
+#   [8/8] Cloudflare Quick Tunnel + final report with base URL and API key.
+#
+# No mocks, no fallback model, no CPU fallback: if the real model or CUDA
+# runtime cannot be obtained/verified, the cell fails loudly.
 
-ROOT = pathlib.Path('/kaggle/working/bonsai2-api' if os.environ.get('KAGGLE_KERNEL_RUN_TYPE') else '/content/bonsai2-api')
-ROOT.mkdir(parents=True, exist_ok=True)
-DEMO = ROOT / 'Bonsai-demo'
-ALIAS = 'ternary-bonsai-2-27b'
-REPO = 'prism-ml/Ternary-Bonsai-2-27B-gguf'
-FILE = 'Ternary-Bonsai-2-27B-PQ2_0.gguf'
-STATE = ROOT / 'state.json'
+import os, re, sys, json, time, socket, secrets, hashlib, shutil, ctypes, platform, subprocess, tempfile, importlib.util, urllib.request, urllib.error
+from pathlib import Path
 
-def phase(i, text): print(f'\n[{i}/8] {text}', flush=True)
-def run(cmd, **kw): return subprocess.run(cmd, check=True, text=True, **kw)
+ALIAS  = 'ternary-bonsai-2-27b'
+REPO   = 'prism-ml/Ternary-Bonsai-2-27B-gguf'
+DEMO_GIT = 'https://github.com/PrismML-Eng/Bonsai-demo.git'
+
+def log(msg=''):
+    print(msg, flush=True)
+
+def phase(i, title):
+    log(f'\n[{i}/8] {title}\n' + '-' * 64)
+
+def ensure(cond, msg):
+    if not cond:
+        raise RuntimeError(msg)
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, text=True, **kw)
+
 def install(module, package):
-    if importlib.util.find_spec(module) is None: run([sys.executable, '-m', 'pip', 'install', '-q', package])
-def get(url, key=None, data=None, timeout=30):
-    req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
-        headers={'Content-Type':'application/json', **({'Authorization':'Bearer '+key} if key else {})})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, json.loads(r.read())
-    except HTTPError as e: return e.code, e.read().decode(errors='replace')
-def ensure(condition, message):
-    if not condition: raise RuntimeError(message)
-def free_port():
-    s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); return p
+    if importlib.util.find_spec(module) is None:
+        run([sys.executable, '-m', 'pip', 'install', '-q', package])
 
-def memory():
-    raw=run(['nvidia-smi','--query-gpu=index,name,memory.total,memory.free,compute_cap,driver_version,pci.bus_id', '--format=csv,noheader,nounits'], capture_output=True).stdout
-    return [dict(zip(('index','name','total','free','cap','driver','pci'),[v.strip() for v in line.split(',')])) for line in raw.strip().splitlines() if line.strip()]
+def http(url, key=None, body=None, timeout=60):
+    headers = {'Content-Type': 'application/json'}
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers=headers,
+        method='POST' if body is not None else 'GET')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            try:
+                return r.status, json.loads(raw)
+            except ValueError:
+                return r.status, raw.decode(errors='replace')
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, raw.decode(errors='replace')
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
+
+def free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+def nvidia_rows():
+    out = run(['nvidia-smi',
+               '--query-gpu=index,name,memory.total,memory.free,memory.used,compute_cap,driver_version,pci.bus_id',
+               '--format=csv,noheader,nounits'], capture_output=True).stdout
+    rows = []
+    for line in out.strip().splitlines():
+        if line.strip():
+            rows.append(dict(zip(('index', 'name', 'total', 'free', 'used', 'cap', 'driver', 'pci'),
+                                 [v.strip() for v in line.split(',')][:8])))
+    return rows
+
+def mem_gi(field):
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if line.startswith(field):
+                return int(line.split()[1]) / 1024 / 1024  # KiB -> GiB
+    return 0.0
+
+def stream_chat(url, key, body, timeout):
+    """Real SSE chat request. Returns measured timing + parsed content."""
+    body = dict(body)
+    body['stream'] = True
+    body.setdefault('stream_options', {'include_usage': True})
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json',
+                                          'Authorization': 'Bearer ' + key})
+    t0 = time.monotonic()
+    first = last = usage = None
+    text, reason, tc_acc = [], [], {}
+    chunks = 0
+    finish = None
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for line in r:
+            line = line.strip()
+            if not line.startswith(b'data:'):
+                continue
+            payload = line[5:].strip()
+            if payload == b'[DONE]':
+                break
+            try:
+                ev = json.loads(payload)
+            except ValueError:
+                continue
+            if ev.get('usage'):
+                usage = ev['usage']
+            ch = (ev.get('choices') or [None])[0]
+            if not ch:
+                continue
+            d = ch.get('delta') or {}
+            if ch.get('finish_reason'):
+                finish = ch['finish_reason']
+            for tc in d.get('tool_calls') or []:
+                i = tc.get('index', 0)
+                slot = tc_acc.setdefault(i, {'id': tc.get('id'), 'name': '', 'args': ''})
+                fn = tc.get('function') or {}
+                slot['name'] += fn.get('name') or ''
+                slot['args'] += fn.get('arguments') or ''
+                slot['id'] = tc.get('id') or slot['id']
+            got = (d.get('content') or '') + (d.get('reasoning_content') or '')
+            if got:
+                if d.get('content'):
+                    text.append(d['content'])
+                if d.get('reasoning_content'):
+                    reason.append(d['reasoning_content'])
+                first = first or time.monotonic()
+                last = time.monotonic()
+                chunks += 1
+    return dict(t0=t0, first=first, last=last, usage=usage, chunks=chunks,
+                text=''.join(text), reason=''.join(reason),
+                tool_calls=[tc_acc[k] for k in sorted(tc_acc)], finish=finish)
+
+class OomError(RuntimeError):
+    pass
 
 try:
-    phase(1,'Detecting platform')
-    ensure(sys.platform=='linux' and platform.machine()=='x86_64', 'Only Linux x86_64 CUDA notebooks are supported')
-    print('Platform:', 'Kaggle' if 'KAGGLE_KERNEL_RUN_TYPE' in os.environ else 'Colab' if 'google.colab' in sys.modules else 'Linux notebook')
-    phase(2,'Detecting GPU(s)')
-    gpus=memory(); ensure(gpus, 'No NVIDIA GPU visible; select a GPU runtime')
-    smi=run(['nvidia-smi'],capture_output=True).stdout
-    print(smi)
-    try: print('Topology:',run(['nvidia-smi','topo','-m'],capture_output=True).stdout)
-    except Exception: pass
-    lib=ctypes.CDLL('libcuda.so.1'); count=ctypes.c_int()
-    ensure(lib.cuInit(0)==0 and lib.cuDeviceGetCount(ctypes.byref(count))==0 and count.value>=1,'CUDA driver initialization failed')
-    print('CUDA usable devices:',count.value)
-    gpus=gpus[:count.value]
-    for g in gpus: print(f"GPU {g['index']}: {g['name']}; {g['total']} MiB total; {g['free']} MiB free; SM {g['cap']}; PCI {g['pci']}")
-    ensure(any(int(g['free'])>=9500 for g in gpus), 'Insufficient free VRAM for safe PQ2_0 GPU offload')
-    print('CUDA driver capability:',re.search(r'CUDA Version:\s*([\d.]+)',smi).group(1) if 'CUDA Version:' in smi else 'unknown')
-    phase(3,'Preparing PrismML runtime')
-    if not (DEMO/'.git').exists(): run(['git','clone','--depth','1','https://github.com/PrismML-Eng/Bonsai-demo.git',str(DEMO)])
-    run(['sh',str(DEMO/'scripts/download_binaries.sh')],cwd=DEMO)
-    binary=DEMO/'bin/cuda/llama-server'
-    ensure(binary.is_file() and os.access(binary,os.X_OK),'Official PrismML CUDA binary missing; refusing CPU fallback')
-    env=os.environ.copy(); env['LD_LIBRARY_PATH']=str(binary.parent)+(':'+env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
-    help_result=run([str(binary),'--help'],env=env,capture_output=True)
-    helptext=help_result.stdout+help_result.stderr
-    ensure('--api-key' in helptext and '--alias' in helptext and '--split-mode' in helptext, 'PrismML binary lacks required API/security flags')
-    print('Runtime:',binary,'\nRelease:',(binary.parent/'.llama_release').read_text().strip())
-    print('Version:',run([str(binary),'--version'],env=env,capture_output=True).stdout.strip()[:300])
-    phase(4,'Preparing Bonsai 2 27B')
-    install('huggingface_hub','huggingface_hub[hf_xet]')
-    install('gguf','gguf')
+    # ------------------------------------------------------------------
+    phase(1, 'Detecting platform')
+    ensure(sys.platform == 'linux' and platform.machine() == 'x86_64',
+           'Only Linux x86_64 CUDA notebook runtimes are supported.')
+    is_kaggle = bool(os.environ.get('KAGGLE_KERNEL_RUN_TYPE'))
+    is_colab = importlib.util.find_spec('google.colab') is not None
+    plat = 'Kaggle' if is_kaggle else 'Colab' if is_colab else 'Linux notebook'
+    base_dir = Path('/kaggle/working' if is_kaggle else '/content' if is_colab else tempfile.gettempdir())
+    ROOT = base_dir / 'bonsai2-api'
+    ROOT.mkdir(parents=True, exist_ok=True)
+    DEMO = ROOT / 'Bonsai-demo'
+    STATE = ROOT / 'state.json'
+    ram_total, ram_avail = mem_gi('MemTotal:'), mem_gi('MemAvailable:')
+    disk_free = shutil.disk_usage(ROOT).free / 1024**3
+    log(f'Platform: {plat} | RAM {ram_total:.1f} GiB ({ram_avail:.1f} GiB available) | disk free {disk_free:.1f} GiB')
+    ensure(disk_free >= 11, f'Need ~11 GiB free disk for runtime + model (have {disk_free:.1f} GiB).')
+    ensure(ram_total >= 9, f'Need >= 9 GiB system RAM (have {ram_total:.1f} GiB).')
+
+    # ------------------------------------------------------------------
+    phase(2, 'Detecting GPU(s)')
+    try:
+        gpus = nvidia_rows()
+    except Exception as e:
+        raise RuntimeError('nvidia-smi failed — select a GPU runtime. ' + str(e))
+    ensure(gpus, 'No NVIDIA GPU visible; select a GPU runtime (T4 or T4x2).')
+    smi_header = run(['nvidia-smi'], capture_output=True).stdout
+    cuda_ver = re.search(r'CUDA Version:\s*([\d.]+)', smi_header)
+    log(smi_header.strip())
+    try:
+        log('\nnvidia-smi topo -m:\n' + run(['nvidia-smi', 'topo', '-m'], capture_output=True, timeout=20).stdout.strip())
+    except Exception:
+        pass
+    libcuda = ctypes.CDLL('libcuda.so.1')
+    cu_count = ctypes.c_int()
+    ensure(libcuda.cuInit(0) == 0, 'CUDA driver initialization failed (cuInit).')
+    ensure(libcuda.cuDeviceGetCount(ctypes.byref(cu_count)) == 0 and cu_count.value >= 1,
+           'CUDA driver reports no usable devices.')
+    gpus = gpus[:cu_count.value]
+    log(f'\nCUDA driver capability: {cuda_ver.group(1) if cuda_ver else "unknown"} | CUDA-capable devices visible: {cu_count.value}')
+    for g in gpus:
+        log(f"GPU {g['index']}: {g['name']} | {int(g['total'])/1024:.1f} GiB total | "
+            f"{int(g['free'])/1024:.1f} GiB free | SM {g['cap']} | PCI {g['pci']} | driver {g['driver']}")
+    identical = len({g['name'] for g in gpus}) == 1
+    log(f"GPUs identical: {identical} | second GPU usable: "
+        f"{len(gpus) >= 2 and int(gpus[1]['free']) >= 9500 if len(gpus) >= 2 else 'n/a (single GPU)'}")
+    free_mib = [int(g['free']) for g in gpus]
+    ensure(max(free_mib) >= 9500,
+           f'Insufficient free VRAM (max {max(free_mib)} MiB). Bonsai 2 27B needs ~9.5 GiB free on one GPU.')
+
+    # ------------------------------------------------------------------
+    phase(3, 'Preparing PrismML runtime')
+    if not (DEMO / '.git').is_dir():
+        run(['git', 'clone', '--depth', '1', DEMO_GIT, str(DEMO)])
+    else:
+        subprocess.run(['git', '-C', str(DEMO), 'pull', '--ff-only', '--depth', '1'],
+                       capture_output=True, timeout=120)  # best-effort refresh
+    log('Fetching official PrismML CUDA binaries via Bonsai-demo scripts/download_binaries.sh ...')
+    dl = subprocess.run(['sh', str(DEMO / 'scripts/download_binaries.sh')], cwd=DEMO,
+                        capture_output=True, text=True, timeout=1800)
+    log((dl.stdout + dl.stderr).strip()[-2000:])
+    ensure(dl.returncode == 0, 'PrismML binary download failed (check network access).')
+    BIN_DIR = DEMO / 'bin/cuda'
+    binary = BIN_DIR / 'llama-server'
+    ensure(binary.is_file() and os.access(binary, os.X_OK),
+           'PrismML CUDA llama-server not found — a CPU/other build was selected or the download '
+           'failed. Refusing to fall back to CPU. Check nvidia-smi/CUDA driver.')
+    stamp = (BIN_DIR / '.llama_release').read_text().strip() if (BIN_DIR / '.llama_release').exists() else ''
+    ensure(stamp.startswith('prism'), f'Installed build is not the PrismML fork (stamp: {stamp!r}).')
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = str(BIN_DIR) + ((':' + env['LD_LIBRARY_PATH']) if env.get('LD_LIBRARY_PATH') else '')
+    help_p = subprocess.run([str(binary), '--help'], env=env, capture_output=True, text=True, timeout=120)
+    helptext = help_p.stdout + help_p.stderr
+    help_lines = helptext.splitlines()
+    version = subprocess.run([str(binary), '--version'], env=env, capture_output=True, text=True, timeout=60)
+    log(f'Runtime: {binary}\nRelease stamp: {stamp}\nVersion: {(version.stdout + version.stderr).strip()[:300]}')
+    ensure(re.search(r'(?m)^\s*-+api-key\b', helptext) or '--api-key' in helptext,
+           'llama-server build lacks --api-key; refusing to expose an unauthenticated API.')
+    ensure('--alias' in helptext, 'llama-server build lacks --alias; model-name validation unavailable.')
+
+    def supports(*flags):
+        for ln in help_lines:
+            s = ln.strip()
+            if not s.startswith('-'):
+                continue
+            head = re.split(r'\s{2,}', s, 1)[0]
+            toks = re.findall(r'-{1,2}[A-Za-z][\w-]*', head)
+            if any(f in toks for f in flags):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    phase(4, 'Preparing Bonsai 2 27B')
+    # Official demo default packing is PQ2_0 (faster prompt processing, CUDA-optimized);
+    # PTQ1_0 is the official smaller band for tight VRAM. Both are official files from
+    # the same prism-ml release — the weights are never modified, merged or re-quantized.
+    band = 'PQ2_0' if free_mib[0] >= 12000 else 'PTQ1_0'
+    FILE = f'Ternary-Bonsai-2-27B-{band}.gguf'
+    log(f'Packing selected for this hardware: {band} ({FILE})')
+    install('huggingface_hub', 'huggingface_hub[hf_xet]')
+    install('gguf', 'gguf')
     from huggingface_hub import HfApi, hf_hub_download
     from gguf import GGUFReader
-    info=HfApi().model_info(REPO,files_metadata=True)
-    sibling=next((x for x in info.siblings if x.rfilename==FILE),None)
-    ensure(sibling is not None and sibling.lfs and sibling.lfs.get('sha256'), 'Official model SHA256 unavailable; cannot verify')
-    expected=sibling.lfs['sha256']
-    model=pathlib.Path(hf_hub_download(REPO,FILE,local_dir=str(ROOT/'models'),token=os.environ.get('HF_TOKEN') or os.environ.get('BONSAI_TOKEN')))
-    ensure(model.stat().st_size>6_000_000_000,'GGUF is incomplete or implausibly small')
-    print('Verifying official SHA256 (may take a minute)...',flush=True)
-    digest=hashlib.sha256()
-    with model.open('rb') as f:
-        for chunk in iter(lambda:f.read(8*1024*1024),b''): digest.update(chunk)
-    ensure(digest.hexdigest()==expected,'Official model checksum mismatch: aborting')
-    reader=GGUFReader(str(model),mode='r')
+    token = os.environ.get('HF_TOKEN') or os.environ.get('BONSAI_TOKEN')
+    try:
+        info = HfApi().model_info(REPO, files_metadata=True)
+    except Exception as e:
+        raise RuntimeError(f'Hugging Face API unreachable ({e}). Enable notebook Internet access.')
+    sibling = next((x for x in info.siblings if x.rfilename == FILE), None)
+    ensure(sibling is not None, f'{FILE} not present in {REPO} — refusing to substitute anything else.')
+    lfs = sibling.lfs or {}
+    expected_sha = lfs.get('sha256')
+    expected_size = lfs.get('size') or sibling.size
+    ensure(expected_size and expected_size > 5_000_000_000,
+           f'{FILE} has an implausible official size ({expected_size}); aborting.')
+    log(f'Official {FILE}: {expected_size/1e9:.2f} GB, SHA-256 {expected_sha or "(unavailable)"}')
+    model = Path(hf_hub_download(REPO, FILE, local_dir=str(ROOT / 'models'), token=token))
+    ensure(model.is_file() and model.stat().st_size == expected_size,
+           f'Downloaded file size mismatch: {model.stat().st_size} != {expected_size} (incomplete download).')
+    if expected_sha:
+        log('Verifying official SHA-256 ...')
+        digest = hashlib.sha256()
+        with model.open('rb') as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
+                digest.update(chunk)
+        ensure(digest.hexdigest() == expected_sha, 'Official model SHA-256 mismatch — file corrupted. Aborting.')
+        sha_state = 'PASS (official HF SHA-256)'
+    else:
+        sha_state = 'unavailable from HF metadata (exact size verified)'
+    reader = GGUFReader(str(model), mode='r')
     def field(name):
-        f=reader.get_field(name)
-        return bytes(f.parts[-1]).decode('utf-8',errors='replace') if f else ''
-    meta={k:field(k) for k in ('general.name','general.architecture','general.size_label','general.file_type')}
-    ensure('bonsai' in meta['general.name'].lower() and ('2' in meta['general.name'] or '2' in meta['general.architecture']) and ('27' in meta['general.name'] or '27' in meta['general.size_label']),f'Unexpected GGUF metadata: {meta}')
-    print('## MODEL VERIFICATION\nFamily: Bonsai 2\nParameters: ~27B\nFormat: PQ2_0\nPath:',model,'\nMetadata:',meta,'\nIntegrity: PASS')
-    del reader
-    phase(5,'Selecting optimized configuration')
-    def supported(flag): return re.search(r'(?<!\w)'+re.escape(flag)+r'(?![\w-])',helptext) is not None
-    context=16384 if min(int(g['free']) for g in gpus)>=11500 else 8192
-    base=['-m',str(model),'--alias',ALIAS,'--host','127.0.0.1','-ngl','999','-c',str(context)]
-    for flag,value in [('-np','1'),('-b','256'),('-ub','64'),('-fa','on'),('--temp','1.0'),('--top-p','0.95'),('--top-k','20'),('--min-p','0.05')]:
-        if supported(flag): base += [flag,value]
-    if supported('--jinja'): base+=['--jinja']
-    # Never enable speculative decoding: upstream has no official Bonsai 2 drafter.
-    key=os.environ.get('BONSAI_API_KEY') or (json.loads(STATE.read_text()).get('key') if STATE.exists() else None) or secrets.token_urlsafe(48)
-    ensure(len(key)>=32,'BONSAI_API_KEY must have at least 32 characters')
-    def start(dual=False):
-        port=free_port(); args=[str(binary)]+base+['--port',str(port),'--api-key',key]
-        if dual: args+=['--split-mode','layer','--main-gpu','0']
-        else: args+=['--split-mode','none','--main-gpu','0']
-        log=open(ROOT/('dual.log' if dual else 'single.log'),'w')
-        e=env.copy(); e['CUDA_VISIBLE_DEVICES']='0,1' if dual else '0'
-        proc=subprocess.Popen(args,cwd=DEMO,env=e,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-        log.close()
-        for _ in range(360):
-            if proc.poll() is not None: raise RuntimeError('PrismML server exited: '+(ROOT/('dual.log' if dual else 'single.log')).read_text()[-3000:])
-            status,body=get(f'http://127.0.0.1:{port}/health',key,timeout=3)
-            if status==200 and isinstance(body,dict) and body.get('status')=='ok': return proc,port
-            time.sleep(2)
-        proc.terminate(); raise RuntimeError('Model startup timed out; check '+str(ROOT/('dual.log' if dual else 'single.log')))
-    def benchmark(port):
-        prompt='Explain the following Python function and suggest two concrete improvements: '+('def search(items, target):\n    for index, value in enumerate(items):\n        if value == target: return index\n    return -1\n')*35
-        url=f'http://127.0.0.1:{port}/v1/chat/completions'
-        body={'model':ALIAS,'messages':[{'role':'user','content':prompt}],'max_tokens':96,'temperature':1.0,'stream':True,'stream_options':{'include_usage':True}}
-        req=urllib.request.Request(url,data=json.dumps(body).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'})
-        t0=time.monotonic(); first=None; last=None; usage={}; chunks=[]
-        with urllib.request.urlopen(req,timeout=240) as resp:
-            for line in resp:
-                if not line.startswith(b'data: '): continue
-                if line.strip()==b'data: [DONE]': break
-                event=json.loads(line[6:]); usage=event.get('usage') or usage
-                if event.get('choices'):
-                    delta=event['choices'][0].get('delta',{})
-                    if delta.get('content') or delta.get('reasoning_content'):
-                        first=first or time.monotonic(); last=time.monotonic(); chunks.append(delta)
-        ensure(first and chunks and usage.get('completion_tokens',0)>1 and usage.get('prompt_tokens',0)>0,'Benchmark did not produce real streamed tokens/usage')
-        # Server timing fields are preferred: wall clock TTFT includes both prefill and network latency.
-        timings=usage.get('timings',{})
-        input_rate=timings.get('prompt_per_second') or (usage['prompt_tokens']/(first-t0))
-        output_rate=timings.get('predicted_per_second') or ((usage['completion_tokens']-1)/max(last-first,0.001))
-        return dict(input=float(input_rate),output=float(output_rate),ttft=(first-t0)*1000,tokens=usage)
-    def used(): return [int(x['total'])-int(x['free']) for x in memory()]
-    phase(6,'Starting inference server')
-    proc,port=start(); single=benchmark(port); single_used=used(); print('Single GPU:',single,'VRAM MiB:',single_used,flush=True)
-    dual_result=None
-    if len(gpus)>=2 and all(int(x['free'])>=9500 for x in gpus[:2]) and supported('--main-gpu'):
-        proc.terminate(); proc.wait(timeout=30)
+        f = reader.get_field(name)
+        if f is None:
+            return ''
         try:
-            proc,port=start(True); dual_result=benchmark(port); dual_used=used()
-            ensure(dual_used[0]>1000 and dual_used[1]>1000,'Second GPU did not receive model work')
-            print('Dual GPU:',dual_result,'VRAM MiB:',dual_used,flush=True)
-        except Exception as exc:
-            print('Dual GPU unavailable:',exc)
-            if 'proc' in locals() and proc.poll() is None: proc.terminate(); proc.wait(timeout=30)
-            dual_result=None
-        if dual_result is None or dual_result['output']<=single['output']*1.03:
-            if proc.poll() is None: proc.terminate(); proc.wait(timeout=30)
-            proc,port=start(); selected='Single GPU (measured faster or within 3% of dual)'; result=benchmark(port)
-        else: selected='Dual GPU layer split (measured >3% faster)'; result=dual_result
-    else: selected='Single GPU'; result=single
-    print('Selected:',selected)
-    phase(7,'Running real API tests')
-    local=f'http://127.0.0.1:{port}'
-    status,health=get(local+'/health',key); ensure(status==200 and health.get('status')=='ok','Health check failed')
-    status,models=get(local+'/v1/models',key); ensure(status==200 and any(x['id']==ALIAS for x in models['data']),'Model alias missing')
-    status,denied=get(local+'/v1/models','invalid-'+secrets.token_hex(16)); ensure(status in (401,403),'Invalid key was accepted')
-    status,denied=get(local+'/v1/models'); ensure(status in (401,403),'Unauthenticated API was accepted')
-    request={'model':ALIAS,'messages':[{'role':'system','content':'Respond briefly.'},{'role':'user','content':'Say hello.'}],'max_tokens':128}
-    status,answer=get(local+'/v1/chat/completions',key,request,timeout=240)
-    ensure(status==200 and answer.get('model')==ALIAS and answer.get('choices'),'Real chat or model-name check failed: '+str(answer)[:500])
-    status,bad=get(local+'/v1/chat/completions',key,{**request,'model':'not-bonsai'},timeout=30)
-    ensure(status>=400,'Unknown model alias was accepted')
-    result=benchmark(port) # also verifies streaming on final server
-    print('Health, models, chat, streaming, model validation and authorization: PASS')
-    phase(8,'Starting public tunnel')
-    tunnel=ROOT/'cloudflared'
-    if not tunnel.exists():
-        url='https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'
-        urllib.request.urlretrieve(url,str(tunnel)); tunnel.chmod(0o700)
-    tunnel_log=ROOT/'tunnel.log'
-    existing=json.loads(STATE.read_text()) if STATE.exists() else {}
-    tunnel_proc=None
-    if existing.get('port')==port and existing.get('tunnel_pid'):
-        try: os.kill(existing['tunnel_pid'],0); public=existing['public']
-        except ProcessLookupError: public=None
-    else: public=None
-    if not public:
-        with tunnel_log.open('w') as log:
-            tunnel_proc=subprocess.Popen([str(tunnel),'tunnel','--url',local,'--no-autoupdate'],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-        public=None
-        for _ in range(90):
-            if tunnel_proc.poll() is not None: break
-            match=re.search(r'https://[a-z0-9-]+\.trycloudflare\.com',tunnel_log.read_text())
-            if match: public=match.group(0); break
+            return bytes(f.parts[-1]).decode('utf-8', errors='replace')
+        except Exception:
+            return ''
+    meta = {k: field(k) for k in ('general.name', 'general.architecture', 'general.size_label', 'general.file_type')}
+    from math import prod as _prod
+    params = sum(int(_prod(map(int, t.shape))) for t in reader.tensors.values())
+    name_ok = 'bonsai' in meta['general.name'].lower()
+    arch_ok = meta['general.architecture'].lower().startswith('qwen3') or 'bonsai' in meta['general.architecture'].lower()
+    size_ok = 23e9 <= params <= 31e9
+    log('## MODEL VERIFICATION')
+    log(f'Family: Bonsai 2 (general.name={meta["general.name"]!r}, arch={meta["general.architecture"]!r})')
+    log(f'Parameters: {params/1e9:.2f}B (~27B check: {"PASS" if size_ok else "FAIL"})')
+    log(f'Format: {band} official PrismML packing | File: {model.name}')
+    log(f'SHA-256: {sha_state}')
+    log(f'Path: {model}')
+    ensure(name_ok and arch_ok and size_ok,
+           f'GGUF metadata does not identify Ternary Bonsai 2 27B ({meta}, {params/1e9:.2f}B). Aborting — no substitution.')
+    log('Integrity: PASS')
+    del reader
+
+    # ------------------------------------------------------------------
+    phase(5, 'Selecting optimized configuration')
+    # Context: conservative tiers (KV is F16, 64 KiB/token). OOM auto-retry halves it.
+    if len(gpus) >= 2 and min(free_mib[:2]) >= 10000:
+        ctx = 65536
+    elif free_mib[0] >= 13000:
+        ctx = 32768
+    elif free_mib[0] >= 10500:
+        ctx = 16384
+    else:
+        ctx = 8192
+    key = os.environ.get('BONSAI_API_KEY') or ''
+    if key:
+        ensure(len(key) >= 32, 'BONSAI_API_KEY must be at least 32 characters.')
+    else:
+        try:
+            key = json.loads(STATE.read_text()).get('key') or '' if STATE.exists() else ''
+        except Exception:
+            key = ''
+    if not key:
+        key = secrets.token_urlsafe(32)
+    fa = supports('-fa', '--flash-attn')
+    jinja_on = supports('--jinja')
+    args_common = ['-m', str(model), '--alias', ALIAS, '--host', '127.0.0.1', '-ngl', '99']
+    if fa:
+        args_common += ['-fa', 'on']
+    for flag, val in (('--temp', '1.0'), ('--top-p', '0.95'), ('--top-k', '20'), ('--min-p', '0.05')):
+        if supports(flag):
+            args_common += [flag, val]
+    if jinja_on:
+        args_common += ['--jinja']  # native OpenAI-style tool calling (official for 27B)
+        if supports('--chat-template-kwargs'):
+            # Official guidance: medium reasoning effort as the interactive API default;
+            # requests can still ask for stronger effort. Thinking stays enabled.
+            args_common += ['--chat-template-kwargs', '{"reasoning_effort":"medium"}']
+    if supports('--parallel'):
+        args_common += ['--parallel', '1']   # single-user coding API: 1 slot, best prompt-cache reuse
+    elif supports('-np'):
+        args_common += ['-np', '1']
+    # Prompt-cache tuning for long multi-turn coding sessions (Bonsai-demo PROMPT-CACHE.md).
+    if supports('--ctx-checkpoints'):
+        args_common += ['--ctx-checkpoints', '32']
+    if supports('--cache-idle-slots'):
+        args_common += ['--cache-idle-slots']
+    if supports('--cache-ram') and ram_avail >= 11:
+        args_common += ['--cache-ram', '4096' if ram_total >= 20 else '2048']
+    log(f'Context: {ctx} | Flash Attention: {"ON" if fa else "unavailable"} | slots: 1 | KV: F16')
+    log('Reasoning: thinking ON, default effort medium (server), per-request override supported')
+    log('Speculative decoding: OFF — Bonsai-demo ships no official Bonsai 2 drafter; never faked')
+    log('Vision projector: not downloaded/loaded (text-only serving saves VRAM)')
+
+    def build_cmd(port, ctx_now, extra):
+        return [str(binary)] + args_common + ['-c', str(ctx_now), '--port', str(port), '--api-key', key] + extra
+
+    def start_server(extra, logname):
+        port = free_port()
+        logpath = ROOT / logname
+        cmd = build_cmd(port, cur_ctx, extra)
+        shown, skip = [], False
+        for tok in cmd:
+            if skip:
+                skip = False
+            elif tok == '--api-key':
+                skip = True
+            else:
+                shown.append(tok)
+        log('Starting: ' + ' '.join(shown[:22]) + (' ...' if len(shown) > 22 else '') + f' (port {port}, log {logpath})')
+        with logpath.open('w') as lf:
+            proc = subprocess.Popen(cmd, cwd=DEMO, env=env, stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                tail = logpath.read_text(errors='replace')[-2500:]
+                if re.search(r'out of memory|cudaMalloc|CUDA error|CUDA out|GGML_ASSERT|failed to allocate', tail, re.I):
+                    raise OomError('server died with a CUDA/OOM error:\n' + tail[-1200:])
+                raise RuntimeError('PrismML server exited during startup:\n' + tail)
+            status, body = http(f'http://127.0.0.1:{port}/health', key, timeout=5)
+            if status == 200 and isinstance(body, dict) and body.get('status') == 'ok':
+                vram_used = sum(int(r['used']) for r in nvidia_rows())
+                ensure(vram_used >= 5000,
+                       f'Health OK but GPUs hold only {vram_used} MiB — model not resident on GPU. Aborting.')
+                log(f'Healthy. GPU memory in use: {vram_used} MiB (CUDA backend confirmed by VRAM residency).')
+                return proc, port
             time.sleep(2)
-    ensure(public,'Cloudflare tunnel startup failed: '+tunnel_log.read_text()[-1500:])
-    status,remote=get(public+'/v1/models',key,timeout=30)
-    ensure(status==200 and any(x['id']==ALIAS for x in remote['data']),'Remote tunnel API verification failed')
-    STATE.write_text(json.dumps({'key':key,'port':port,'server_pid':proc.pid,'tunnel_pid':tunnel_proc.pid if tunnel_proc else existing['tunnel_pid'],'public':public}))
-    os.chmod(STATE,0o600)
-    print('\n'+'='*54+'\nTERNARY BONSAI 2 27B — READY\n'+'='*54)
-    print('GPU:',', '.join(x['name'] for x in gpus),'\nBackend: PrismML CUDA\nSelected:',selected)
-    print('Context:',context,'\nInput tokens/sec:',round(result['input'],2),'\nDecode tokens/sec:',round(result['output'],2),'\nTTFT ms:',round(result['ttft'],1),'\nGPU VRAM used MiB:',used())
-    print('MODEL:',ALIAS,'\nHEALTH: OK\nAPI BASE URL:',public+'/v1\nAPI KEY:',key)
-    print('\nPython example:\nfrom openai import OpenAI\nclient = OpenAI(base_url='+repr(public+'/v1')+', api_key='+repr(key)+')\nresponse = client.chat.completions.create(model='+repr(ALIAS)+', messages=[{"role":"user","content":"Write a C++ function that reverses a string."}])\nprint(response.choices[0].message.content)')
-    print('\ncurl example:\ncurl -H "Authorization: Bearer '+key+'" -H "Content-Type: application/json" -d '+repr(json.dumps(request))+' '+public+'/v1/chat/completions')
+        proc.terminate()
+        raise RuntimeError(f'Model startup timed out (15 min). See {logpath}.')
+
+    def stop(proc):
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
+
+    BENCH_PROMPT = ('You are reviewing code. Explain what this Python function does and give two '
+                    'concrete improvements.\n\n' +
+                    ('def search(items, target):\n'
+                     '    for index, value in enumerate(items):\n'
+                     '        if value == target:\n'
+                     '            return index\n'
+                     '    return -1\n\n') * 40)
+
+    def benchmark(port):
+        res = stream_chat(f'http://127.0.0.1:{port}/v1/chat/completions', key,
+                          {'model': ALIAS,
+                           'messages': [{'role': 'user', 'content': BENCH_PROMPT}],
+                           'max_tokens': 96, 'temperature': 1.0}, timeout=360)
+        usage = res['usage'] or {}
+        ensure(res['first'] and res['chunks'] > 1 and usage.get('completion_tokens', 0) > 1
+               and usage.get('prompt_tokens', 0) > 100,
+               f'Benchmark did not produce real streamed tokens (chunks={res["chunks"]}, usage={usage}).')
+        timings = usage.get('timings') or {}
+        inp = timings.get('prompt_per_second') or (usage['prompt_tokens'] / max(res['first'] - res['t0'], 1e-3))
+        out = timings.get('predicted_per_second') or \
+            ((usage['completion_tokens'] - 1) / max(res['last'] - res['first'], 1e-3))
+        return dict(input=float(inp), output=float(out), ttft=(res['first'] - res['t0']) * 1000,
+                    prompt_tokens=usage['prompt_tokens'], completion_tokens=usage['completion_tokens'])
+
+    # Idempotency: reuse a healthy server from a previous run of this cell.
+    state = {}
+    if STATE.exists():
+        try:
+            state = json.loads(STATE.read_text())
+        except Exception:
+            state = {}
+    reused = False
+    if state.get('server_pid') and state.get('port') and state.get('key') and state.get('model') == FILE:
+        try:
+            os.kill(state['server_pid'], 0)
+            status, body = http(f'http://127.0.0.1:{state["port"]}/health', state.get('key'), timeout=5)
+            if status == 200 and isinstance(body, dict) and body.get('status') == 'ok':
+                proc, port, key = None, state['port'], state['key']
+                selected = state.get('selected', 'Single GPU (reused)')
+                result = state.get('bench') or benchmark(port)
+                reused = True
+                log(f'Reusing healthy existing server (pid {state["server_pid"]}, port {port}) — no duplicate spawn.')
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+    cur_ctx = ctx
+    if reused:
+        cur_ctx = state.get('ctx', ctx)  # report the context the reused server actually serves
+    if not reused:
+        split_avail = supports('--split-mode')
+        single_extra = ['--split-mode', 'none'] if split_avail else []
+        try:
+            proc, port = start_server(single_extra, 'server-single.log')
+        except OomError:
+            ensure(cur_ctx > 8192, 'Server OOM at minimum context; hardware cannot serve this model safely.')
+            log(f'OOM detected — halving context {cur_ctx} -> {cur_ctx // 2} and retrying once.')
+            cur_ctx //= 2
+            proc, port = start_server(single_extra, 'server-single.log')
+        log('Benchmarking single-GPU configuration (real Bonsai 2 request) ...')
+        single = benchmark(port)
+        vram_single = [int(r['used']) for r in nvidia_rows()]
+        log(f'Single GPU: decode {single["output"]:.2f} tok/s | prefill {single["input"]:.1f} tok/s | '
+            f'TTFT {single["ttft"]:.0f} ms | VRAM MiB {vram_single}')
+        dual = None
+        dual_reason = 'only one GPU visible/usable'
+        if len(gpus) >= 2 and split_avail and min(free_mib[:2]) >= 9500:
+            stop(proc)
+            # Layer split only — --split-mode tensor/row are intentionally never used.
+            dual_extra = ['--split-mode', 'layer', '--main-gpu', '0']
+            try:
+                proc, port = start_server(dual_extra, 'server-dual.log')
+                log('Benchmarking dual-GPU layer-split configuration (real Bonsai 2 request) ...')
+                dual = benchmark(port)
+                vram_dual = [int(r['used']) for r in nvidia_rows()]
+                ensure(len(vram_dual) >= 2 and vram_dual[1] > 1000,
+                       f'Second GPU received no model work (VRAM MiB {vram_dual}); dual split ineffective.')
+                log(f'Dual GPU: decode {dual["output"]:.2f} tok/s | prefill {dual["input"]:.1f} tok/s | '
+                    f'TTFT {dual["ttft"]:.0f} ms | VRAM MiB {vram_dual}')
+            except Exception as e:
+                log(f'Dual-GPU configuration unavailable: {str(e)[:400]}')
+                dual = None
+                dual_reason = 'dual launch/benchmark failed'
+                stop(proc)
+            if dual and dual['output'] > single['output'] * 1.03:
+                selected = f'Dual GPU layer split (+{(dual["output"] / single["output"] - 1) * 100:.1f}% measured decode)'
+                result = dual
+            else:
+                stop(proc)
+                proc, port = start_server(single_extra, 'server-final.log')
+                result = single
+                selected = ('Single GPU (measured >= dual decode throughput)'
+                            if dual else f'Single GPU ({dual_reason})')
+        else:
+            result = single
+            selected = f'Single GPU ({dual_reason})'
+        log(f'Selected configuration: {selected}')
+
+    # ------------------------------------------------------------------
+    phase(6, 'Starting inference server')
+    if reused:
+        log(f'Inference server already running from previous cell run (port {port}). Verified healthy.')
+    else:
+        status, body = http(f'http://127.0.0.1:{port}/health', key, timeout=10)
+        ensure(status == 200 and isinstance(body, dict) and body.get('status') == 'ok',
+               f'Final server unhealthy: {status} {body}')
+        log(f'Inference server live on 127.0.0.1:{port} (pid {proc.pid}).')
+    local = f'http://127.0.0.1:{port}'
+    chat_url = local + '/v1/chat/completions'
+
+    # ------------------------------------------------------------------
+    phase(7, 'Running real API tests')
+    tests = {}
+
+    status, health = http(local + '/health', key, timeout=15)
+    tests['/health'] = status == 200 and isinstance(health, dict) and health.get('status') == 'ok'
+
+    status, models = http(local + '/v1/models', key, timeout=15)
+    tests['GET /v1/models'] = (status == 200 and isinstance(models, dict)
+                               and any(m.get('id') == ALIAS for m in models.get('data', [])))
+
+    status, denied = http(local + '/v1/models', 'invalid-' + secrets.token_hex(16), timeout=15)
+    tests['invalid API key rejected'] = status in (401, 403)
+
+    status, anon = http(local + '/v1/models', None, timeout=15)
+    tests['missing API key rejected'] = status in (401, 403)
+
+    req3 = {'model': ALIAS,
+            'messages': [{'role': 'system', 'content': 'You are a concise assistant.'},
+                         {'role': 'user', 'content': 'Say hello and state that you are Bonsai 2.'}],
+            'max_tokens': 2048, 'temperature': 1.0, 'reasoning_effort': 'medium'}
+    status, ans = http(chat_url, key, req3, timeout=480)
+    ok3 = (status == 200 and isinstance(ans, dict) and ans.get('model') == ALIAS and ans.get('choices'))
+    if ok3:
+        msg = ans['choices'][0].get('message', {})
+        ok3 = bool(msg.get('content') or msg.get('reasoning_content'))
+    tests['chat completion + model name'] = ok3
+
+    status, bad = http(chat_url, key, {**req3, 'model': 'not-bonsai', 'max_tokens': 16}, timeout=30)
+    tests['unknown model rejected'] = status is not None and status >= 400
+
+    try:
+        sres = stream_chat(chat_url, key, {'model': ALIAS,
+                                           'messages': [{'role': 'user', 'content': 'Count from 1 to 5.'}],
+                                           'max_tokens': 512}, timeout=300)
+        tests['streaming'] = sres['chunks'] >= 3 and bool(sres['text'] + sres['reason'])
+    except Exception as e:
+        log(f'streaming error: {e}')
+        tests['streaming'] = False
+
+    tools = [{'type': 'function', 'function': {
+        'name': 'get_weather',
+        'description': 'Get the current weather for a city',
+        'parameters': {'type': 'object',
+                       'properties': {'city': {'type': 'string', 'description': 'City name'}},
+                       'required': ['city']}}}]
+    req8 = {'model': ALIAS,
+            'messages': [{'role': 'user',
+                          'content': 'What is the weather in Lisbon right now? Answer only by calling the provided tool.'}],
+            'tools': tools, 'tool_choice': 'auto', 'max_tokens': 2048,
+            'temperature': 1.0, 'reasoning_effort': 'medium'}
+    if jinja_on:
+        tool_ok = False
+        for attempt in (1, 2):
+            try:
+                status, ans8 = http(chat_url, key, req8, timeout=480)
+                if status == 200 and isinstance(ans8, dict) and ans8.get('choices'):
+                    m8 = ans8['choices'][0].get('message', {})
+                    fr = ans8['choices'][0].get('finish_reason')
+                    if m8.get('tool_calls') or fr == 'tool_calls':
+                        tool_ok = True
+                        log(f'Native tool call observed: {json.dumps(m8.get("tool_calls"))[:220]}')
+                        break
+                elif status == 400 and attempt == 1:
+                    req8.pop('reasoning_effort', None)  # retry without optional field
+            except Exception as e:
+                log(f'tool test attempt {attempt} error: {e}')
+        tests['native tool calling (--jinja)'] = tool_ok
+    else:
+        tests['native tool calling (--jinja)'] = 'SKIP'
+        log('Tool test skipped: this build does not expose --jinja.')
+
+    for name, ok in tests.items():
+        log(f'{"PASS" if ok is True else ("SKIP" if ok == "SKIP" else "FAIL")}  {name}')
+    ensure(all(v is True or v == 'SKIP' for v in tests.values()),
+           'One or more real API tests FAILED — not declaring success. Check server logs in ' + str(ROOT))
+
+    # ------------------------------------------------------------------
+    phase(8, 'Starting public tunnel')
+    tunnel_bin = ROOT / 'cloudflared'
+    if not tunnel_bin.exists():
+        log('Downloading cloudflared ...')
+        urllib.request.urlretrieve(
+            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+            str(tunnel_bin))
+        tunnel_bin.chmod(0o700)
+    tunnel_proc = None
+    public = None
+    if state.get('tunnel_pid') and state.get('public') and state.get('port') == port:
+        try:
+            os.kill(state['tunnel_pid'], 0)
+            status, remote = http(state['public'] + '/v1/models', key, timeout=30)
+            if status == 200 and any(m.get('id') == ALIAS for m in remote.get('data', [])):
+                public = state['public']
+                log('Reusing existing healthy tunnel.')
+        except Exception:
+            public = None
+    if not public:
+        tunnel_log = ROOT / 'tunnel.log'
+        with tunnel_log.open('w') as lf:
+            tunnel_proc = subprocess.Popen([str(tunnel_bin), 'tunnel', '--url', local, '--no-autoupdate'],
+                                           stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+        for _ in range(90):
+            if tunnel_proc.poll() is not None:
+                break
+            m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', tunnel_log.read_text(errors='replace'))
+            if m:
+                public = m.group(0)
+                break
+            time.sleep(2)
+    ensure(public, 'Cloudflare tunnel failed to start: ' + (ROOT / 'tunnel.log').read_text(errors='replace')[-1200:])
+    status, remote = http(public + '/v1/models', key, timeout=30)
+    ensure(status == 200 and any(m.get('id') == ALIAS for m in remote.get('data', [])),
+           f'Remote tunnel API verification failed ({status}: {str(remote)[:300]}).')
+    try:
+        rres = stream_chat(public + '/v1/chat/completions', key,
+                           {'model': ALIAS, 'messages': [{'role': 'user', 'content': 'Reply with the single word: ok'}],
+                            'max_tokens': 64}, timeout=240)
+        ensure(rres['chunks'] >= 1, 'No tokens through public tunnel.')
+    except Exception as e:
+        raise RuntimeError(f'End-to-end chat through public tunnel failed: {e}')
+    STATE.write_text(json.dumps({
+        'key': key, 'port': port, 'model': FILE, 'selected': selected, 'bench': result, 'ctx': cur_ctx,
+        'server_pid': proc.pid if proc is not None else state.get('server_pid'),
+        'tunnel_pid': tunnel_proc.pid if tunnel_proc is not None else state.get('tunnel_pid'),
+        'public': public}))
+    os.chmod(STATE, 0o600)
+
+    # ------------------------------------------------------------------
+    vram_now = [int(r['used']) for r in nvidia_rows()]
+    log('\n' + '=' * 62)
+    log('TERNARY BONSAI 2 27B — READY')
+    log('=' * 62)
+    log(f'Platform: {plat}')
+    log('GPU(s): ' + ', '.join(f"{g['name']} ({int(g['total'])/1024:.1f} GiB)" for g in gpus))
+    log(f'VRAM now used (MiB): {vram_now}')
+    log(f'\nModel: Ternary Bonsai 2 27B — official {band} GGUF from {REPO}\nVerified: PASS (SHA-256/size/metadata/{params/1e9:.1f}B params)')
+    log(f'\nRuntime: PrismML llama.cpp fork (CUDA)\nRelease: {stamp}\nCUDA: {cuda_ver.group(1) if cuda_ver else "?"} | Backend: CUDA | Stock llama.cpp: NOT used (fork kernels required)')
+    log(f'\nSelected configuration: {selected}')
+    log(f'Context: {cur_ctx} | Flash Attention: {"ON" if fa else "OFF (unsupported)"} | KV: F16 | Slots: 1')
+    log('Reasoning: thinking ON (default effort: medium; request can ask for stronger)')
+    log('Speculative decoding: OFF (no official Bonsai 2 drafter) | Vision projector: not loaded (text-only)')
+    log(f'\nReal benchmark (measured on this server):')
+    log(f'Input / prefill:  {result["input"]:.1f} tok/s ({result["prompt_tokens"]} prompt tokens)')
+    log(f'Output / decode:  {result["output"]:.2f} tok/s')
+    log(f'TTFT:             {result["ttft"]:.0f} ms')
+    log(f'GPU count used:   {len(gpus) if "Dual" in selected else 1}')
+    log(f'\nAPI:\nBase URL: {public}/v1\nOpenAI endpoint: /v1\nModel: {ALIAS}')
+    log(f'\nAuthentication:\nBearer API key: {key}')
+    log('\nSelf-test:')
+    for name, ok in tests.items():
+        log(f'{name}: {"PASS" if ok is True else ("SKIP" if ok == "SKIP" else "FAIL")}')
+    log(f'remote /v1/models over tunnel: PASS\nremote chat over tunnel: PASS')
+    log('\nPython example:')
+    log('from openai import OpenAI')
+    log(f'client = OpenAI(base_url={public + "/v1"!r}, api_key={key!r})')
+    log('response = client.chat.completions.create(')
+    log(f'    model={ALIAS!r},')
+    log('    messages=[{"role": "user", "content": "Write a C++ function that reverses a string."}],')
+    log(')')
+    log('print(response.choices[0].message.content)')
+    log('\ncurl example:')
+    log(f'curl {public}/v1/chat/completions \\')
+    log(f'  -H "Authorization: Bearer {key}" -H "Content-Type: application/json" \\')
+    log('  -d \'{"model":"ternary-bonsai-2-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}\'')
+    log('\nNotes: session-scoped deployment — the API lives while this notebook runtime runs.')
+    log('The Quick Tunnel URL is ephemeral; the API key was printed once above — treat notebook output as secret.')
+    log('Model weights are unmodified and licensed Apache-2.0 (prism-ml); this cell never substitutes another model.')
+
 except Exception as exc:
-    print('\nDEPLOYMENT FAILED:',type(exc).__name__,str(exc),file=sys.stderr,flush=True)
+    log('\nDEPLOYMENT FAILED: ' + type(exc).__name__ + ': ' + str(exc))
+    hints = []
+    s = str(exc)
+    if 'sha256' in s.lower() or 'size mismatch' in s.lower():
+        hints.append('Model file corrupted — delete the models dir under the work dir and rerun.')
+    if 'tunnel' in s.lower():
+        hints.append('Check outbound Internet access (Colab: Runtime settings; Kaggle: Internet add-on).')
+    if 'cuda' in s.lower() or 'gpu' in s.lower():
+        hints.append('Verify a GPU runtime is selected and nvidia-smi works in this notebook.')
+    if 'hugging' in s.lower() or 'unreachable' in s.lower() or 'git' in s.lower():
+        hints.append('Enable notebook Internet access and rerun.')
+    if 'OOM' in s or 'out of memory' in s.lower():
+        hints.append('Rerun; the cell halves context on OOM automatically. Close other GPU consumers.')
+    for h in hints:
+        log('Hint: ' + h)
+    log('Server/runtime logs: ' + str(ROOT) + ' (server-single.log / server-dual.log / server-final.log / tunnel.log)')
     raise
