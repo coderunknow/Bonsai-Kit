@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+models/
+bin/
+state.json
+*.log
