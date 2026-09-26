@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2.4 — 2026-09-26
+
+### Fixed
+- **Cloudflare Quick Tunnel verification DNS retry**: Remote tunnel API verification in phase [8/8]
+  now polls with retries (`verify_tunnel_connectivity`) to accommodate Cloudflare Quick Tunnel
+  DNS propagation delay and edge routing initialization. Previously, a single immediate HTTP request
+  was executed right after extracting the `trycloudflare.com` URL from the log, failing with
+  `RuntimeError: Remote tunnel API verification failed (None: URLError: <urlopen error [Errno -2] Name or service not known>)`.
+  The retry loop waits across initial DNS resolution errors (`[Errno -2] Name or service not known`)
+  and edge warmup HTTP responses (502/503/52x) until the OpenAI endpoint returns HTTP 200 with the
+  verified model alias, or times out cleanly after 90 seconds.
+- **Tunnel chat verification resilience**: End-to-end chat completion through the public tunnel
+  retries up to 3 times to absorb transient socket drops during Cloudflare edge warmup.
+- **Tunnel lifecycle & binary safety**: Terminate stale or unresponsive tunnel processes before
+  starting a new tunnel. Download `cloudflared` atomically via a temporary file with size
+  validation (≥ 10 MB) to prevent executing corrupted or partial binaries from interrupted downloads.
+- **Python 3.13 deprecation warning**: Replaced positional `maxsplit` argument in
+  `re.split(r'\s{2,}', s, maxsplit=1)` with keyword argument via top-level `parse_supported_flags()`,
+  eliminating `DeprecationWarning: 'maxsplit' is passed as positional argument`.
+- **Benchmark usage resilience**: Safely access streaming usage metrics and timings with
+  fallbacks (`.get()`) to prevent `KeyError` or `TypeError` if streaming options or usage
+  statistics are omitted by the server.
+- **Regression test suite**: Added comprehensive offline unit tests covering tunnel DNS retry,
+  502 edge response handling, premature process termination detection, invalid model payload rejection,
+  and deprecation-warning-free CLI flag parsing (15 tests total).
+
+
 ## v0.2.3 — 2026-09-26
 
 ### Fixed

@@ -384,6 +384,35 @@ def stream_chat(url, key, body, timeout):
 class OomError(RuntimeError):
     pass
 
+def parse_supported_flags(helptext):
+    """Extract command-line option flags from llama-server --help text."""
+    flags = set()
+    lines = helptext.splitlines() if isinstance(helptext, str) else helptext
+    for ln in lines:
+        s = ln.strip()
+        if not s.startswith('-'):
+            continue
+        head = re.split(r'\s{2,}', s, maxsplit=1)[0]
+        flags.update(re.findall(r'-{1,2}[A-Za-z][\w-]*', head))
+    return flags
+
+def verify_tunnel_connectivity(public, key, request=http, max_wait=90, interval=2, proc=None, log_path=None):
+    """Wait for Cloudflare Quick Tunnel DNS propagation and edge routing."""
+    deadline = time.monotonic() + max_wait
+    status, remote = None, None
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            tail = ''
+            if log_path and Path(log_path).is_file():
+                tail = ': ' + Path(log_path).read_text(errors='replace')[-600:]
+            return False, f'Cloudflare tunnel process exited prematurely (code {proc.poll()}){tail}'
+        status, remote = request(public + '/v1/models', key, timeout=10)
+        if (status == 200 and isinstance(remote, dict) and
+                any(m.get('id') == ALIAS for m in remote.get('data', []))):
+            return True, remote
+        time.sleep(min(interval, max(0.1, deadline - time.monotonic())))
+    return False, f'Remote tunnel API verification failed ({status}: {str(remote)[:300]}).'
+
 ROOT = None
 
 try:
@@ -488,16 +517,10 @@ try:
            'llama-server build lacks --api-key; refusing to expose an unauthenticated API.')
     ensure('--alias' in helptext, 'llama-server build lacks --alias; model-name validation unavailable.')
 
+    supported_flags = parse_supported_flags(helptext)
+
     def supports(*flags):
-        for ln in help_lines:
-            s = ln.strip()
-            if not s.startswith('-'):
-                continue
-            head = re.split(r'\s{2,}', s, 1)[0]
-            toks = re.findall(r'-{1,2}[A-Za-z][\w-]*', head)
-            if any(f in toks for f in flags):
-                return True
-        return False
+        return any(f in supported_flags for f in flags)
 
     # ------------------------------------------------------------------
     phase(4, 'Preparing Bonsai 2 27B')
@@ -897,22 +920,35 @@ try:
     # ------------------------------------------------------------------
     phase(8, 'Starting public tunnel')
     tunnel_bin = ROOT / 'cloudflared'
-    if not tunnel_bin.exists():
+    if not tunnel_bin.is_file() or tunnel_bin.stat().st_size < 10_000_000:
         log('Downloading cloudflared ...')
-        urllib.request.urlretrieve(
-            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
-            str(tunnel_bin))
-        tunnel_bin.chmod(0o700)
+        tmp_bin = ROOT / 'cloudflared.tmp'
+        try:
+            urllib.request.urlretrieve(
+                'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+                str(tmp_bin))
+            tmp_bin.chmod(0o700)
+            os.replace(tmp_bin, tunnel_bin)
+        finally:
+            tmp_bin.unlink(missing_ok=True)
+    tunnel_bin.chmod(0o700)
     tunnel_proc = None
     public = None
     if active_state.get('tunnel_pid') and active_state.get('public'):
+        old_pid = active_state['tunnel_pid']
         try:
-            os.kill(active_state['tunnel_pid'], 0)
-            status, remote = http(active_state['public'] + '/v1/models', key, timeout=30)
-            if status == 200 and any(m.get('id') == ALIAS for m in remote.get('data', [])):
+            os.kill(old_pid, 0)
+            status, remote = http(active_state['public'] + '/v1/models', key, timeout=10)
+            if (status == 200 and isinstance(remote, dict) and
+                    any(m.get('id') == ALIAS for m in remote.get('data', []))):
                 public = active_state['public']
                 log('Reusing existing healthy tunnel.')
-        except Exception:
+            else:
+                try:
+                    os.kill(old_pid, 15)
+                except OSError:
+                    pass
+        except OSError:
             public = None
     if not public:
         tunnel_log = ROOT / 'tunnel.log'
@@ -927,17 +963,28 @@ try:
                 public = m.group(0)
                 break
             time.sleep(2)
-    ensure(public, 'Cloudflare tunnel failed to start: ' + (ROOT / 'tunnel.log').read_text(errors='replace')[-1200:])
-    status, remote = http(public + '/v1/models', key, timeout=30)
-    ensure(status == 200 and any(m.get('id') == ALIAS for m in remote.get('data', [])),
-           f'Remote tunnel API verification failed ({status}: {str(remote)[:300]}).')
-    try:
-        rres = stream_chat(public + '/v1/chat/completions', key,
-                           {'model': ALIAS, 'messages': [{'role': 'user', 'content': 'Reply with the single word: ok'}],
-                            'max_tokens': 64}, timeout=240)
-        ensure(rres['chunks'] >= 1, 'No tokens through public tunnel.')
-    except Exception as e:
-        raise RuntimeError(f'End-to-end chat through public tunnel failed: {e}')
+        ensure(public, 'Cloudflare tunnel failed to start: ' + (ROOT / 'tunnel.log').read_text(errors='replace')[-1200:])
+        log(f'Tunnel URL: {public}. Verifying remote tunnel connectivity ...')
+        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http, proc=tunnel_proc, log_path=tunnel_log)
+        ensure(ok, err_or_remote)
+    else:
+        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http, max_wait=10)
+        ensure(ok, err_or_remote)
+
+    chat_ok = False
+    last_chat_err = None
+    for attempt in range(1, 4):
+        try:
+            rres = stream_chat(public + '/v1/chat/completions', key,
+                               {'model': ALIAS, 'messages': [{'role': 'user', 'content': 'Reply with the single word: ok'}],
+                                'max_tokens': 64}, timeout=240)
+            if rres and rres.get('chunks', 0) >= 1:
+                chat_ok = True
+                break
+        except Exception as e:
+            last_chat_err = e
+            time.sleep(2)
+    ensure(chat_ok, f'End-to-end chat through public tunnel failed: {last_chat_err}')
     active_state.update(tunnel_pid=tunnel_proc.pid if tunnel_proc is not None else active_state.get('tunnel_pid'),
                         public=public)
     save_state(STATE, active_state)
