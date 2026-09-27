@@ -294,6 +294,9 @@ python -m unittest -v test_streaming_recovery   # 94 tests: SSE fragmentation, c
 python -m unittest -v test_power_features       # 67 tests: config precedence, budgets,
                                                 # branching, export, endpoints, MCP,
                                                 # structured output, batch, the importable API
+python -m unittest -v test_deployment           # 59 tests: the cell's helpers and its
+                                                # module structure, including that the
+                                                # client and cell versions agree
 python3 bonsai_chat.py --selftest               # 31 end-to-end checks against the protocol stub
 python3 bonsai_chat.py --doctor                 # live diagnostics against a real deployment
 ```
