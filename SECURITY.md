@@ -44,6 +44,21 @@ For vulnerabilities in this cell, open an issue or contact the repository mainta
 For upstream issues (runtime, kernels, model files), report to
 `PrismML-Eng/Bonsai-demo` / `PrismML-Eng/llama.cpp` / the `prism-ml` model repos.
 
+## v0.6.0 notes
+
+- The config file can hold endpoints and MCP server definitions, so it is written
+  `0600` and `--save-config` never writes a secret into it. Endpoint keys belong in the
+  environment: `api_key_env` names the variable, the file only names it.
+- MCP servers are child processes that run outside the tool sandbox, so every MCP tool is
+  registered at risk level `write` and goes through the normal approval prompt. Tool
+  output is data, not instructions.
+- The client's HTML export loads nothing external — no CDN, no web fonts, no scripts —
+  and escapes all conversation content, because a transcript is private.
+- Supervision only ever restarts a process this cell started and verified by executable
+  path, command line and liveness, and it stops after 3 restarts per component per
+  15 minutes rather than retrying indefinitely.
+- `heartbeat.json` and `diagnostics.json` continue to exclude the API key.
+
 ## v0.5.0 notes
 
 - `diagnostics.json`, written next to the server logs, deliberately excludes the API key:
