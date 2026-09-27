@@ -37,6 +37,10 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Environment: BONSAI_BASE_URL, BONSAI_API_KEY, BONSAI_MODEL, BONSAI_SESSION.\n'
                'The deployment cell (colab_kaggle_cell.py) prints the base URL and key.')
+    p.add_argument('--serve', action='store_true', help='serve the local web UI and API proxy')
+    p.add_argument('--serve-host', default='127.0.0.1')
+    p.add_argument('--serve-port', type=int, default=0)
+    p.add_argument('--no-browser', action='store_true')
     p.add_argument('--base-url', default=os.environ.get('BONSAI_BASE_URL'),
                    help='e.g. https://<tunnel-host>/v1')
     p.add_argument('--api-key', default=os.environ.get('BONSAI_API_KEY'),
@@ -310,6 +314,16 @@ def main(argv=None):
 
     if args.selftest:
         return run_selftest(style=style)
+    if args.serve:
+        from .serve import serve
+        httpd = serve(args.serve_host, args.serve_port, args.base_url, args.api_key, args.model)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+        return 0
 
     from .config import explicit_args
     explicit = explicit_args(parser, argv or ())

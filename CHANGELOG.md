@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0
+- Added the stdlib local web server and same-origin streaming proxy with committed web UI.
+- Added connect/config, health, models, capabilities, chat and stop API routes.
+
+
 ## v0.6.0 — 2026-09-27
 
 Two headline goals, in priority order: **(1) stability** — make the GPU deployment path

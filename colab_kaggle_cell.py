@@ -450,7 +450,7 @@ def verify_tunnel_connectivity(public, key, request=http, max_wait=90, interval=
 # ======================================================================
 GPU_MEMORY = gpu_process_memory     # per-process VRAM attribution
 
-VERSION = '0.6.0'
+VERSION = '0.7.0'
 
 # ======================================================================
 # Structured failures
