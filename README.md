@@ -9,25 +9,52 @@ Paste the entire contents of [`colab_kaggle_cell.py`](colab_kaggle_cell.py) into
 select an NVIDIA GPU runtime (T4 or T4×2), enable notebook Internet access, and run.
 No second cell, no manual commands, no config files.
 
-## What v0.5.0 adds
+## What v0.6.0 adds
 
-- **Reliable streaming.** An incremental SSE parser that survives fragmented reads,
-  keep-alive comments and multi-line data; a stream object that always closes its HTTP
-  response; and a broken stream that reports its partial text instead of quietly becoming
-  a finished answer.
-- **Real thinking control.** `/think off|low|medium|high|max` drives the runtime's actual
-  `thinking_budget_tokens` field, `/effort medium|xhigh` drives the template's effort, and
-  `/reasoning full|compact|hidden` chooses how the trace is shown — live, without a
-  restart and without touching history.
-- **Lower latency.** One persistent connection instead of a handshake per request,
-  coalesced terminal flushing, and reads that return as soon as a chunk arrives.
-- **Hardware autotuning.** Flags discovered from `--help`, context chosen from the KV cost
-  the server reports, a bounded autotune cached per hardware, and a bounded OOM ladder.
-- **Recovery.** Structured failures that say what broke, what was preserved and what to
-  do; a tunnel that is restarted on its own without touching the model; sessions that
-  survive being killed mid-write.
-- **Honesty.** `unknown` is a first-class diagnostic state, `n/a` is printed instead of a
-  guess, and no benchmark is quoted that was not measured.
+Two goals, in this order: **stability** (the GPU deployment path is now executed and
+survivable) and **feature breadth** (the capabilities v0.5.0 was missing).
+
+Stability
+
+- **The deployment path is actually executed.** `cell_harness.py` drives the cell's real
+  module-level body offline, against a fake GPU: fake `nvidia-smi` with real per-process
+  VRAM attribution, a CUDA driver compiled from C and driven through the real `ctypes`
+  path, a fake PrismML `llama-server` *executable* (a compiled launcher owns the PID, so
+  `/proc/<pid>/exe` and `argv[0]` really are `bin/cuda/llama-server`), a fake Hugging Face
+  layer with a synthetic 7.21 GB sparse GGUF, and a fake `cloudflared` backed by a real
+  loopback proxy. 73 end-to-end tests run the deployment to READY in about a second and
+  then break it on purpose.
+- **A supervised deployment.** Health-gated liveness (not "is the PID alive"), hang
+  detection through a real generation probe with a stall timeout, and restarts bounded in
+  both count (3) and rate (per 15 minutes, with backoff). Crash, OOM and hang are told
+  apart from the server's own log, because the repair differs: an OOM steps the context
+  down, a crash restarts where it was. The tunnel and the model have separate budgets, so
+  neither can cascade into the other. Every heal is logged into `diagnostics.json` and
+  `heartbeat.json`.
+- **Two real bugs this found.** `plan_to_args()` emitted value-less flags, so
+  `--parallel` swallowed `-c 8192` and the server refused to start; and a rerun that
+  adopted a live server re-ran `download_binaries.sh`, overwriting the executable it was
+  running from (`ETXTBSY`). Both fixed, both with regression tests.
+
+Features (all capability-detected, all opt-in)
+
+- **Vision**, gated on `BONSAI_VISION=1`: the official `mmproj` from the same repo with
+  the same SHA-256/size discipline, its VRAM counted before the server starts, and image
+  tokens reserved from the context. Refused — not silently dropped — when the build lacks
+  `--mmproj`, when no projector is published, or when the fitted context cannot hold
+  weights + projector + the image reserve.
+- **Multi-slot** (`BONSAI_SLOTS=N`) and **KV4** (`BONSAI_KV4=1`), each refused when the
+  build does not advertise the flag, each with its cost stated: a slot carries its own KV
+  cache so the per-slot context shrinks, and q4_0 is roughly 3.5× smaller and *slower*.
+  Single slot stays the default.
+- **Client power features**: a config file with inspectable precedence, persona presets,
+  conversation branching, MCP tools through the existing registry, multi-endpoint use with
+  a per-endpoint capability map, tools that start the moment their arguments are complete,
+  token/turn budgets, batch mode, and JSON/HTML export.
+
+Honesty is unchanged: `unknown` is a first-class diagnostic state, `n/a` is printed
+instead of a guess, no benchmark is quoted that was not measured, and `PASS` is never
+printed for a check that did not run.
 
 ## What the cell does
 
@@ -41,6 +68,8 @@ No second cell, no manual commands, no config files.
 | 6 | Starts the PrismML `llama-server` OpenAI API on `127.0.0.1` with `--api-key`, verifies GPU residency via VRAM usage |
 | 7 | Real end-to-end tests: `/health`, `/v1/models`, chat completion, streaming, model alias reporting, bearer auth, invalid/missing key rejection, native tool calling (`--jinja`). `READY` is printed only if every test passes |
 | 8 | Cloudflare Quick Tunnel exposing only the API port, verified remotely and treated as disposable — restarted on its own if it dies, without ever touching the model. Prints base URL, API key, measured benchmark numbers, recovery steps taken, client examples, and writes `diagnostics.json` |
+
+| 9 | Supervision: two independent watchdogs (inference server and tunnel) watch liveness, probe for hangs with a real generation, and repair what they can within a bounded restart budget. `heartbeat.json` is rewritten every 60 s so a returning session can prove what is still live |
 
 ## Using the API
 
@@ -104,6 +133,14 @@ python3 bonsai_chat.py --image diagram.png -p "describe what this measures"
 | Context | Real token counts from `/tokenize`, a budget that reserves room for the template and the answer, whole-turn trimming that never orphans a `tool` message from its `tool_calls`, and `/compact` to summarise old turns instead of dropping them |
 | Resilience | Retries 429/5xx and connect failures, but **never** replays a chat POST that may already be generating; drops `reasoning_effort`/`thinking_budget_tokens`/`tools` only after the build rejects them with a 400; explains a dead Quick Tunnel instead of dumping a traceback |
 | Diagnostics | `--doctor [--json]` reports supported / unsupported / unknown / degraded per capability with the evidence behind each; `--benchmark` measures TTFT, prefill and decode; `/stats` and `/caps` in-session |
+| Configuration | A config file (`bonsai.json`, `~/.config/bonsai/config.json`, …) plus persona presets. Precedence, lowest to highest: defaults → file → persona → environment → the flags you typed. `/config` prints where every value came from |
+| Branching | `/fork <name>`, `/branches`, `/branch <name>`, `/branch del`, `/branch rename` — a branch is a snapshot, stored as an extra line in the same session file, so schema 2 files still load everywhere |
+| Endpoints | `/endpoints [name]` switches between named endpoints from the config file. Each gets its own client, capability map and token cache: a capability map belongs to the server it was measured on |
+| MCP tools | Any MCP server over stdio (`mcpServers` in the config file, the same shape Claude Desktop uses) registers its tools into the same `ToolRegistry`, with the same approval, timeout and output caps. Colliding names become `server__tool` |
+| Structured output | `--json-schema FILE` / `/schema`. Proved with a real request before use: a server that accepts `response_format` and answers in prose anyway is reported as unsupported, and the field is not sent |
+| Budgets | `--budget-tokens`, `--budget-turns`, `--price-per-mtok`; `/spend` reports. Counted only from what the server reported; cost stays `n/a` until you supply a price |
+| Batch | `--batch file.jsonl --out results.jsonl`: the same client, retry policy and tool loop, one conversation per item, a per-item error instead of a crash |
+| Export | `--export out.json` or `out.html` (`/export` in session). The HTML is self-contained: no CDN, no external resources, content escaped |
 
 `/help` lists every command. Useful extras:
 
@@ -111,12 +148,39 @@ python3 bonsai_chat.py --image diagram.png -p "describe what this measures"
 python3 bonsai_chat.py --benchmark          # TTFT, prefill and decode, median/min/max/p95
 python3 bonsai_chat.py --doctor --json      # machine-readable capability report
 python3 bonsai_chat.py --think off -p "..." # answer without a thinking trace
+python3 bonsai_chat.py --save-config --config bonsai.json   # starter config + personas
+python3 bonsai_chat.py --config bonsai.json --persona code  # use a preset
+python3 bonsai_chat.py --batch jobs.jsonl --out results.jsonl
+python3 bonsai_chat.py --session chat.jsonl --fork draft -p "try it another way"
 ```
 
-Two honest limits: the served model is **text-only** (no
-`mmproj`), so an attached image is never *seen* unless you deploy with a vision projector —
-the client says so in the message it sends; and `run_shell`/`write_file`/`http_get` are
-gated behind an approval prompt unless you pass `--auto-approve`.
+Programmatically, the same code path the CLI uses:
+
+```python
+from bonsai_chat.api import Bonsai
+
+bot = Bonsai(base_url='http://127.0.0.1:8080/v1', api_key='...')
+print(bot.ask('What is 6*7?').text)
+
+@bot.tool('weather', 'Current weather for a city',
+          {'type': 'object', 'properties': {'city': {'type': 'string'}},
+          'required': ['city']})
+def weather(args):
+    return 'raining'
+```
+
+**No second web UI.** The PrismML runtime already ships a web chat at the server root,
+and a second one would be a second renderer and a second auth surface to keep honest for
+no capability the runtime does not already have. `--export out.html` covers "I want to
+read this later", and `diagnostics.json` / `heartbeat.json` cover "what is running".
+
+Three honest limits. The default deployment is **text-only** (no `mmproj`), so an attached
+image is never *seen* unless you deploy with `BONSAI_VISION=1` — the client says so in the
+message it sends. `run_shell`/`write_file`/`http_get` are gated behind an approval prompt
+unless you pass `--auto-approve`. And the deployment path has been executed end to end
+against a fake GPU, offline, in this repository — it has still **not** been run against
+real Bonsai 2 weights on real hardware here, so no inference-quality or throughput claim
+is made for it.
 
 Try it with no deployment at all — `--mock` and `--selftest` run against
 [`mock_bonsai_server.py`](mock_bonsai_server.py), a stub that speaks the same protocol as the
@@ -124,7 +188,7 @@ PrismML llama.cpp fork with **scripted replies** (it is not a model and runs no 
 
 ```bash
 python3 bonsai_chat.py --mock     # interactive, scripted answers
-python3 bonsai_chat.py --selftest # 20 protocol/behaviour checks
+python3 bonsai_chat.py --selftest # 31 protocol/behaviour checks
 ```
 
 Optional environment variables (read from the notebook environment/secrets):
@@ -163,6 +227,9 @@ rounds to three significant figures so a three-sample measurement is never prese
 | `the request reached the server but no reply came back` | the stream was lost after generation started | the client refuses to replay it, so you do not get a duplicated answer — `/retry` if you want it re-run |
 | tunnel `edge-error 502/503` | the edge is not routing yet | the cell retries; the model itself is still live on `127.0.0.1` |
 | `server died with a CUDA/OOM error` | the context did not fit | the cell steps the context down automatically; free VRAM yourself if it still fails — unrelated GPU processes are never killed |
+| `BONSAI_VISION=1 was requested but this PrismML build does not advertise --mmproj` | no multimodal projector in this build | vision stays off on purpose. Unset it, or use a build with the projector |
+| `supervision stopped: the restart budget is exhausted` | the server or tunnel kept failing | read `diagnostics.json` — every attempt is logged with what was detected, what was preserved and what changed |
+| `refusing to replace it under a live process` | the binary a verified server runs from went missing | stop that server yourself; the cell will not overwrite an executable that is in use |
 
 ## Guarantees and limits
 
@@ -175,8 +242,12 @@ rounds to three significant figures so a three-sample measurement is never prese
   tests, `PASS` is never printed for a check that was not actually run, and a capability
   that was never tested is reported as `unknown` rather than assumed. `--benchmark` prints
   `n/a` for anything it could not measure (including VRAM, which is server-side).
-- **No speculative decoding** (no official Bonsai 2 drafter exists) and **no vision tower**
-  (text-only serving saves VRAM) — both stated explicitly in the output.
+- **No speculative decoding** (no official Bonsai 2 drafter exists). Vision is opt-in and
+  off by default because text-only serving saves VRAM; KV4 and multi-slot are opt-in too,
+  each refused when the build lacks the flag. All stated explicitly in the output.
+- **Bounded supervision.** A watchdog may restart a component at most 3 times per 15
+  minutes, then it stops and reports. It only ever touches a process this cell started
+  and verified by executable path, command line and liveness.
 - **Safe reruns.** A rerun reuses only a verified server from this work directory
   (even if a prior run failed while starting the tunnel). A different running
   GPU job is never stopped or mistaken for Bonsai; if VRAM is insufficient,
@@ -190,34 +261,65 @@ rounds to three significant figures so a three-sample measurement is never prese
 
 ## Verification
 
-`python -m py_compile colab_kaggle_cell.py` checks syntax and
-`python -m unittest -v test_deployment` runs offline rerun regressions without a GPU. A full integration
-run requires a GPU notebook runtime and is not claimed by CI here.
+Everything below is offline: no GPU, no model, no network, and deterministic.
 
-The chat client is verified the same way — offline, no GPU, no model:
+The deployment cell
+
+```bash
+python3 -m unittest -v test_cell_deployment
+# 73 tests: the cell's real module-level body run against a fake GPU, to READY and then
+# broken on purpose — OOM ladder, measured-context upgrade, autotune cache, dual GPU,
+# no GPU, cuInit failure, non-fork stamp, corrupt identity, SHA-256 mismatch, refusal to
+# run unauthenticated, reattach, stale PID, corrupt state, a tunnel that never publishes,
+# a dead tunnel, a dead model, a hang, bounded restarts, vision on/off/refused,
+# multi-slot, KV4
+```
+
+`cell_harness.py` builds the fakes. The fake `llama-server` is a compiled launcher that
+owns the PID and runs a Python server honouring the real flags, writing llama.cpp's own
+startup log (including the `KV buffer size = ... MiB` lines the cell measures), serving
+`/health`, `/props`, `/slots`, `/v1/models` and streaming chat, and requiring the bearer
+key everywhere. It can be told to boot slowly, OOM above a context, crash after N
+requests, hang, or reject a flag. The fake `cloudflared` publishes a real
+`*.trycloudflare.com`-shaped URL and backs it with a real loopback proxy, so public
+requests are real HTTP.
+
+The chat client
 
 ```bash
 python -m unittest -v test_chat_client          # 82 tests: transport, streaming, tools,
                                                 # images, markdown, history, REPL, CLI, doctor
 python -m unittest -v test_streaming_recovery   # 94 tests: SSE fragmentation, cancellation,
                                                 # disconnects, context, reasoning, recovery
-python3 bonsai_chat.py --selftest               # 20 end-to-end checks against the protocol stub
+python -m unittest -v test_power_features       # 67 tests: config precedence, budgets,
+                                                # branching, export, endpoints, MCP,
+                                                # structured output, batch, the importable API
+python -m unittest -v test_deployment           # 59 tests: the cell's helpers and its
+                                                # module structure, including that the
+                                                # client and cell versions agree
+python3 bonsai_chat.py --selftest               # 31 end-to-end checks against the protocol stub
 python3 bonsai_chat.py --doctor                 # live diagnostics against a real deployment
 ```
 
 `test_chat_client` and `test_streaming_recovery` drive the shipped client over real HTTP
 against [`mock_bonsai_server.py`](mock_bonsai_server.py), which answers with scripted
-content and can reproduce 26 deterministic failure modes (fragmented SSE, mid-stream
-disconnect, partial tool calls, 429/5xx, timeouts, context overflow, …), so what is
-executed is the code that ships.
+content and can reproduce 30 deterministic failure modes (fragmented SSE, mid-stream
+disconnect, partial tool calls, 429/5xx, timeouts, context overflow, a server that
+ignores `response_format`, …), so what is executed is the code that ships.
 
 ```bash
-python3 -m unittest test_chat_client test_streaming_recovery test_deployment
-# 235 tests, all offline, no GPU and no model
+python3 -m unittest discover -s . -p 'test_*.py'
+# 375 tests, all offline, no GPU and no model
 ```
 
-End-to-end inference quality against the real 27B model still requires a GPU notebook
-runtime and is not claimed here. Upstream references:
+**What has not been verified.** The GPU deployment path has never been run against real
+Bonsai 2 weights on real hardware in this repository: what is verified is the decision
+logic, the recovery logic and the wire protocol, against fakes. Real-hardware behaviour —
+actual VRAM residency, actual decode speed, whether the official `mmproj` file names and
+sizes match what the fake advertises, and whether a PrismML build really prints the
+`--mmproj` flag the way the tests assume — is unverified and is not claimed here. The
+vision, multi-slot and KV4 paths in particular are exercised only against a fake runtime
+whose `--help` this repository wrote. Upstream references:
 [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) (source of truth for running these
 models), [model card](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
 [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp),

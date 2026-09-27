@@ -30,12 +30,22 @@
 # No mocks, no fallback model, no CPU fallback: if the real model or CUDA
 # runtime cannot be obtained/verified, the cell fails loudly.
 
-import os, re, sys, json, time, socket, secrets, hashlib, shutil, ctypes, platform, subprocess, tempfile, importlib.util, urllib.request, urllib.error
+import os, re, sys, json, time, socket, secrets, hashlib, shutil, ctypes, platform,\
+       subprocess, tempfile, threading, importlib.util, urllib.request, urllib.error
 from pathlib import Path
 
 ALIAS  = 'ternary-bonsai-2-27b'
 REPO   = 'prism-ml/Ternary-Bonsai-2-27B-gguf'
 DEMO_GIT = 'https://github.com/PrismML-Eng/Bonsai-demo.git'
+
+# --- injectable seams (see the full block above VERSION for the callable ones) ---
+MEMINFO = '/proc/meminfo'            # RAM totals (a notebook has >= 9 GiB; CI may not)
+CUDA_LIB = 'libcuda.so.1'            # CUDA driver: cuInit + cuDeviceGetCount
+PROC_ROOT = Path('/proc')            # process identity, so a PID is never trusted alone
+POLL_INTERVAL = 2.0                  # seconds between readiness polls
+STARTUP_TIMEOUT = 900.0              # seconds to wait for llama-server to answer /health
+TUNNEL_ATTEMPTS = 90                 # polls before a tunnel that never publishes a URL fails
+CLOUDFLARED_MIN_BYTES = 10_000_000   # a smaller file means the download was truncated
 
 def log(msg=''):
     print(msg, flush=True)
@@ -209,6 +219,10 @@ def http(url, key=None, body=None, timeout=60):
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'
 
+# --- the callable seams (defined once `http` exists) ---
+HTTP = http                         # request function (urllib-based)
+URL_OPEN = urllib.request.urlopen   # stream opener, so a tunnel URL can be redirected
+
 def gpu_process_memory(pid):
     """GPU MiB attributed to a process, not to unrelated notebook workloads."""
     out = run(['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory',
@@ -217,9 +231,11 @@ def gpu_process_memory(pid):
                if len(parts := line.split(',')) == 2 and parts[0].strip() == str(pid)
                and parts[1].strip().isdigit())
 
-def require_capacity(free_mib, existing):
+def require_capacity(free_mib, existing, extra_mib=0.0):
+    """`extra_mib` is VRAM the configuration must hold on top of the weights (a vision
+    projector, for instance) and is checked before anything is downloaded or started."""
     if not existing:
-        ensure(max(free_mib) >= 9500,
+        ensure(max(free_mib) >= 9500 + extra_mib,
                f'Insufficient free VRAM (max {max(free_mib)} MiB). Bonsai 2 27B needs '
                '~9.5 GiB free on one GPU for a new server. If a previous notebook '
                'server is occupying VRAM, stop it and rerun; unrelated GPU processes '
@@ -327,14 +343,14 @@ def nvidia_rows():
                                  [v.strip() for v in line.split(',')][:8])))
     return rows
 
-def mem_gi(field):
-    with open('/proc/meminfo') as f:
+def mem_gi(field, meminfo=MEMINFO):
+    with open(meminfo) as f:
         for line in f:
             if line.startswith(field):
                 return int(line.split()[1]) / 1024 / 1024  # KiB -> GiB
     return 0.0
 
-def stream_chat(url, key, body, timeout):
+def stream_chat(url, key, body, timeout, open_url=URL_OPEN):
     """Real SSE chat request. Returns measured timing + parsed content."""
     body = dict(body)
     body['stream'] = True
@@ -347,7 +363,7 @@ def stream_chat(url, key, body, timeout):
     text, reason, tc_acc = [], [], {}
     chunks = 0
     finish = None
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with open_url(req, timeout=timeout) as r:
         for line in r:
             line = line.strip()
             if not line.startswith(b'data:'):
@@ -419,7 +435,22 @@ def verify_tunnel_connectivity(public, key, request=http, max_wait=90, interval=
         time.sleep(min(interval, max(0.1, deadline - time.monotonic())))
     return False, f'Remote tunnel API verification failed ({status}: {str(remote)[:300]}).'
 
-VERSION = '0.5.0'
+# ======================================================================
+# Injectable seams
+#
+# The deployment below runs at module level, because a Colab/Kaggle user pastes
+# this file into one cell and expects it to deploy. That used to make the whole
+# path untestable: v0.5.0 verified it with unit tests on pure helpers plus an AST
+# check that every name resolves — never by running it. v0.6.0 closes that gap.
+# The offline harness (cell_harness.py) execs this file's definitions, rebinds
+# these names to fakes, and then runs the real deployment body against them.
+#
+# Every default here is the real thing. A seam is only ever *rebound* by the
+# test harness; the deployment itself never branches on whether it is faked.
+# ======================================================================
+GPU_MEMORY = gpu_process_memory     # per-process VRAM attribution
+
+VERSION = '0.6.0'
 
 # ======================================================================
 # Structured failures
@@ -524,7 +555,7 @@ def kv_mib_per_token(buffers, ctx):
 
 def choose_context(free_mib, per_token_mib, model_mib, overhead_mib=1200.0,
                    reserve_mib=512.0, tiers=CONTEXT_TIERS, max_context=MODEL_MAX_CONTEXT,
-                   ram_avail_gib=None, gpus=1):
+                   ram_avail_gib=None, gpus=1, slots=1, extra_mib=0.0):
     """Pick the largest context tier that provably fits, from a measured per-token cost.
 
     Nothing here assumes a fixed bytes/token figure: the caller passes the KV cost the
@@ -534,16 +565,22 @@ def choose_context(free_mib, per_token_mib, model_mib, overhead_mib=1200.0,
     `overhead_mib` covers CUDA context, compute buffers and allocator slack; `reserve_mib`
     is headroom we refuse to give away, because a server that starts with 20 MiB free
     dies on the first long prompt.
+
+    `slots` matters because llama.cpp sizes the KV cache per slot: `--parallel N` at
+    context C allocates N caches of C tokens, not one. `extra_mib` is VRAM the
+    configuration must also hold (a loaded vision projector, for example) — counted
+    before the cache rather than discovered as an OOM.
     """
     usable = (min(free_mib) if isinstance(free_mib, (list, tuple)) else free_mib)
     if not usable or usable <= 0:
         return tiers[0]
     # Weights are counted once, not per GPU: a layer split shares them across devices,
     # so the binding constraint is the *smallest* device's free memory minus its share.
-    share = model_mib / max(1, gpus)
+    share = (model_mib + extra_mib) / max(1, gpus)
     budget_mib = max(0.0, usable - share - overhead_mib - reserve_mib)
     if per_token_mib and per_token_mib > 0:
-        fits = int(budget_mib / per_token_mib)
+        per_slot = per_token_mib * max(1, slots)
+        fits = int(budget_mib / per_slot)
         best = tiers[0]
         for tier in tiers:
             if tier <= fits and tier <= max_context:
@@ -622,11 +659,19 @@ def build_flag_plan(supported_flags, cpu_count=None, ram_avail_gib=None, fa=None
 
 
 def plan_to_args(plan):
+    """Flags to actually pass.
+
+    Only entries that carry a value are emitted. A bare flag with no value (a knob we
+    know exists but have no evidence for, e.g. `--parallel` before the slot policy is
+    applied) must never be appended here: it would swallow the next token on the
+    command line — `-c 8192` would be parsed as the *value* of the bare flag and the
+    server would refuse to start.
+    """
     args = []
     for name in [t[0] for t in TUNABLES]:
         entry = plan.get(name)
-        if entry:
-            args += list(entry)
+        if entry and len(entry) >= 2:
+            args += list(entry[:2])
     return args
 
 
@@ -746,8 +791,287 @@ def process_is(pid, binary=None, argv_contains=(), proc_root=Path('/proc')):
 
 
 # ======================================================================
+# Supervision: health-gated liveness, hang detection, bounded restarts
+#
+# A notebook runtime is not a server room. A Colab/Kaggle kernel can sit idle for an
+# hour; the GPU process can die on its own; and a long generation can stall without the
+# process ever exiting. A PID that is alive proves nothing, so this supervisor watches
+# the two things that do: does /health answer, and does a *real* generation produce a
+# real token within a stall timeout?
+#
+# Three failure modes are told apart because the correct response differs:
+#   * OOM      -> step the context down the ladder and restart (smaller KV cache fits);
+#   * crash    -> restart at the same context (nothing about the config was wrong);
+#   * hang     -> restart and record it (the process was alive and useless).
+#
+# Two invariants:
+#   * a model restart never touches the tunnel, and a tunnel restart never touches the
+#     model — neither may cascade into the other. Both keep their own budget.
+#   * restart *count* and restart *rate* are bounded. Past the budget supervision stops
+#     and reports, because a server that will not stay up is something the user has to
+#     see rather than something to flap against forever.
+# ======================================================================
+WATCHDOG_INTERVAL = 20.0         # seconds between liveness checks
+STALL_TIMEOUT = 180.0            # seconds a real generation may produce no first token
+HANG_CHECK_INTERVAL = 300.0      # seconds between generation probes
+MAX_RESTARTS = 3                 # per component, within RESTART_WINDOW
+RESTART_WINDOW = 900.0           # seconds; the rate half of the budget
+RESTART_BACKOFF = (2.0, 5.0, 15.0, 30.0)
+HEALTH_CONFIRMATIONS = 2         # failed checks before acting: one 503 is not a dead server
+HEARTBEAT_INTERVAL = 60.0        # seconds between heartbeat rewrites
+OOM_PATTERN = re.compile(r'out of memory|cudaMalloc|CUDA error|CUDA out|GGML_ASSERT|'
+                         r'failed to allocate', re.I)
+
+
+def classify_exit(log_text):
+    """'oom' or 'crash', read from the server's own log. No guessing from exit codes."""
+    if log_text and OOM_PATTERN.search(log_text):
+        return 'oom'
+    return 'crash'
+
+
+class RestartBudget:
+    """A bounded number of restarts, and a bounded rate of them."""
+
+    def __init__(self, max_restarts=MAX_RESTARTS, window=RESTART_WINDOW, now=time.monotonic):
+        self.max_restarts = max_restarts
+        self.window = window
+        self.attempts = []
+        self._now = now
+
+    def allow(self):
+        self._prune()
+        return len(self.attempts) < self.max_restarts
+
+    def note(self):
+        self.attempts.append(self._now())
+
+    def _prune(self):
+        cutoff = self._now() - self.window
+        self.attempts = [t for t in self.attempts if t >= cutoff]
+
+    @property
+    def used(self):
+        self._prune()
+        return len(self.attempts)
+
+    def to_dict(self):
+        return {'max': self.max_restarts, 'used': self.used,
+                'window_s': self.window, 'exhausted': not self.allow()}
+
+
+class Supervisor:
+    """Watch one component and repair it, inside a budget that cannot loop forever."""
+
+    def __init__(self, name, health, repair, preserved='', on_event=None, log=log,
+                 interval=WATCHDOG_INTERVAL, stall_timeout=STALL_TIMEOUT,
+                 hang_check_interval=HANG_CHECK_INTERVAL, probe=None, budget=None,
+                 confirmations=HEALTH_CONFIRMATIONS, sleep=time.sleep, now=time.monotonic):
+        self.name = name
+        self._health = health              # () -> (ok, detail)
+        self._repair = repair              # (reason, detail) -> what changed
+        self._probe = probe                # (timeout) -> (ok, detail) real generation
+        self.preserved = preserved
+        self._on_event = on_event or (lambda event: None)
+        self._log = log
+        self.interval = interval
+        self.stall_timeout = stall_timeout
+        self.hang_check_interval = hang_check_interval
+        self.confirmations = confirmations
+        self.budget = budget or RestartBudget(now=now)
+        self._sleep = sleep
+        self._now = now
+        self._stop = threading.Event()
+        self._thread = None
+        self.events = []
+        self.failures = 0
+        self.last_probe_at = 0.0
+        self.checks = 0
+
+    # -- lifecycle ----------------------------------------------------
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self.loop, daemon=True,
+                                        name='bonsai-supervisor-' + self.name)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.step()
+            except Exception as exc:        # supervision must never kill the deployment
+                self._log(f'[{self.name}] supervision error: {exc}')
+
+    # -- one pass -----------------------------------------------------
+    def step(self):
+        """Run one check. Returns an event dict, or None when nothing was wrong."""
+        self.checks += 1
+        ok, detail = self._health()
+        if not ok:
+            self.failures += 1
+            if self.failures < self.confirmations:
+                self._log(f'[{self.name}] health check failed ({detail}); '
+                          f'{self.confirmations - self.failures} more before acting')
+                return None
+            return self._act('unhealthy', detail)
+        self.failures = 0
+        if self._probe is None:
+            return None
+        if self._now() - self.last_probe_at < self.hang_check_interval:
+            return None
+        self.last_probe_at = self._now()
+        good, probe_detail = self._probe(self.stall_timeout)
+        if good:
+            return None
+        return self._act('hang', probe_detail)
+
+    def _act(self, reason, detail):
+        if not self.budget.allow():
+            event = dict(component=self.name, action='give-up', detected=reason,
+                         detail=str(detail)[:200], preserved=self.preserved,
+                         changed='supervision stopped: the restart budget is exhausted')
+            self._record(event)
+            self.stop()
+            return event
+        backoff = RESTART_BACKOFF[min(self.budget.used, len(RESTART_BACKOFF) - 1)]
+        self._sleep(backoff)
+        self.budget.note()
+        try:
+            changed = self._repair(reason, detail) or 'restarted'
+        except Exception as exc:
+            event = dict(component=self.name, action='repair-failed', detected=reason,
+                         detail=str(detail)[:200], preserved=self.preserved,
+                         changed=f'restart attempt failed: {exc}')
+            self._record(event)
+            return event
+        event = dict(component=self.name, action='restart', detected=reason,
+                     detail=str(detail)[:200], preserved=self.preserved, changed=changed)
+        self._record(event)
+        self.failures = 0
+        self.last_probe_at = self._now()
+        return event
+
+    def _record(self, event):
+        self.events.append(event)
+        self._on_event(event)
+        self._log(f'[{self.name}] {event["action"]}: detected {event["detected"]} '
+                  f'({str(event.get("detail"))[:120]})')
+        self._log(f'  preserved: {event.get("preserved") or "n/a"}')
+        self._log(f'  changed:   {event.get("changed") or "n/a"}')
+
+    def report(self):
+        return {'component': self.name, 'checks': self.checks,
+                'budget': self.budget.to_dict(),
+                'events': list(self.events)}
+
+
+# ======================================================================
+# Heartbeat — so a reattached session can prove the server is still the same one
+#
+# A Colab/Kaggle idle *browser* disconnect does not stop the runtime, and the server is
+# started in its own session so an evicted or restarted kernel does not take it down
+# with it. What the user needs on return is proof of what is still running: this file.
+# ======================================================================
+def write_heartbeat(path, facts):
+    """Atomically record liveness. Never fatal: it is a diagnostic, not state."""
+    payload = dict(facts)
+    payload['written_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    payload['epoch'] = time.time()
+    try:
+        tmp = Path(str(path) + '.tmp')
+        tmp.write_text(json.dumps(payload, indent=2, default=str))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return payload
+
+
+# ======================================================================
 # Diagnostics
 # ======================================================================
+def sha256_file(path, chunk=8 * 1024 * 1024):
+    """Stream a SHA-256 so a 7 GB model never has to be held in memory."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(chunk), b''):
+            digest.update(block)
+    return digest
+
+
+def truthy_env(name):
+    """Opt-in flags are read once, here, so 'which env var enables X' has one answer."""
+    return (os.environ.get(name) or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Vision is opt-in and VRAM-accounted. The projector is never picked by guessing a
+# filename: either the user names the exact official file, or the Q8_0 tower the
+# upstream demo uses is chosen from what the repo actually publishes.
+MMPROJ_PREFIX = 'mmproj'
+MMPROJ_PREFERRED = ('q8_0', 'hqq')
+
+
+def pick_mmproj(siblings, explicit=None):
+    """Return the official mmproj filename, or raise. Never substitutes."""
+    names = sorted(getattr(x, 'rfilename', '') for x in (siblings or ()))
+    candidates = [n for n in names if n.startswith(MMPROJ_PREFIX) and n.endswith('.gguf')]
+    if explicit:
+        if explicit not in names:
+            raise RuntimeError(f'BONSAI_MMPROJ={explicit!r} is not published in {REPO}; '
+                               'refusing to substitute a different projector.')
+        return explicit
+    if not candidates:
+        raise RuntimeError(f'{REPO} publishes no mmproj-*.gguf, so vision cannot be '
+                           'enabled without substituting a projector — refusing.')
+    preferred = [n for n in candidates if any(t in n.lower() for t in MMPROJ_PREFERRED)]
+    if len(preferred) == 1:
+        return preferred[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise RuntimeError('several vision projectors are published (' + ', '.join(candidates)
+                       + '); set BONSAI_MMPROJ to the exact official filename.')
+
+
+# Image tokens are billed against the context: the model allows roughly 4096 image
+# tokens and 1 token is about a 32x32 pixel patch. A turn that can carry images must
+# therefore reserve room for them instead of discovering the shortfall at runtime.
+MODEL_MAX_IMAGE_TOKENS = 4096
+DEFAULT_IMAGE_MAX_TOKENS = 1024
+IMAGES_PER_TURN = 2                 # what a single chat turn is budgeted to carry
+
+
+def image_context_reserve(image_max_tokens, images_per_turn=IMAGES_PER_TURN):
+    """Context tokens held back for images, so the text budget is honest."""
+    tokens = max(0, min(int(image_max_tokens or 0), MODEL_MAX_IMAGE_TOKENS))
+    return tokens * max(0, int(images_per_turn))
+
+
+def slot_report(request, local, key, timeout=5):
+    """What the runtime says about its slots, or None when it does not say anything.
+
+    Read-only and non-fatal: newer llama-server builds expose /slots, older ones do
+    not, and `unknown` is a better answer than a fabricated slot count.
+    """
+    status, body = request(local + '/slots', key, timeout=timeout)
+    if status != 200 or not isinstance(body, list):
+        return None
+    slots = []
+    for entry in body:
+        if not isinstance(entry, dict):
+            continue
+        slots.append({k: entry.get(k) for k in
+                      ('id', 'state', 'n_ctx', 'cache_tokens', 'model', 'task_id')})
+    return slots or None
+
+
 def diagnostics_payload(**facts):
     """Machine-readable deployment state, for `--json`-style monitoring."""
     payload = {'version': VERSION, 'alias': ALIAS, 'repo': REPO}
@@ -768,12 +1092,14 @@ try:
     except Exception:
         is_colab = False
     plat = 'Kaggle' if is_kaggle else 'Colab' if is_colab else 'Linux notebook'
-    base_dir = Path('/kaggle/working' if is_kaggle else '/content' if is_colab else tempfile.gettempdir())
+    base_dir = Path(os.environ.get('BONSAI_ROOT') or
+                     ('/kaggle/working' if is_kaggle else '/content' if is_colab
+                      else tempfile.gettempdir()))
     ROOT = base_dir / 'bonsai2-api'
     ROOT.mkdir(parents=True, exist_ok=True)
     DEMO = ROOT / 'Bonsai-demo'
     STATE = ROOT / 'state.json'
-    ram_total, ram_avail = mem_gi('MemTotal:'), mem_gi('MemAvailable:')
+    ram_total, ram_avail = mem_gi('MemTotal:', MEMINFO), mem_gi('MemAvailable:', MEMINFO)
     disk_free = shutil.disk_usage(ROOT).free / 1024**3
     log(f'Platform: {plat} | RAM {ram_total:.1f} GiB ({ram_avail:.1f} GiB available) | disk free {disk_free:.1f} GiB')
     ensure(ram_total >= 9, f'Need >= 9 GiB system RAM (have {ram_total:.1f} GiB).')
@@ -792,7 +1118,7 @@ try:
         log('\nnvidia-smi topo -m:\n' + run(['nvidia-smi', 'topo', '-m'], capture_output=True, timeout=20).stdout.strip())
     except Exception:
         pass
-    libcuda = ctypes.CDLL('libcuda.so.1')
+    libcuda = ctypes.CDLL(CUDA_LIB)
     cu_count = ctypes.c_int()
     ensure(libcuda.cuInit(0) == 0, 'CUDA driver initialization failed (cuInit).')
     ensure(libcuda.cuDeviceGetCount(ctypes.byref(cu_count)) == 0 and cu_count.value >= 1,
@@ -812,7 +1138,8 @@ try:
             pass
     if not isinstance(state, dict):
         state = {}
-    existing = managed_server(ROOT, state)
+    existing = managed_server(ROOT, state, request=HTTP, proc_root=PROC_ROOT,
+                              gpu_memory=GPU_MEMORY)
     requested_key = os.environ.get('BONSAI_API_KEY') or ''
     if requested_key:
         ensure(len(requested_key) >= 32, 'BONSAI_API_KEY must be at least 32 characters.')
@@ -836,13 +1163,25 @@ try:
     else:
         subprocess.run(['git', '-C', str(DEMO), 'pull', '--ff-only', '--depth', '1'],
                        capture_output=True, timeout=120)  # best-effort refresh
-    log('Fetching official PrismML CUDA binaries via Bonsai-demo scripts/download_binaries.sh ...')
-    dl = subprocess.run(['sh', str(DEMO / 'scripts/download_binaries.sh')], cwd=DEMO,
-                        capture_output=True, text=True, timeout=1800)
-    log((dl.stdout + dl.stderr).strip()[-2000:])
-    ensure(dl.returncode == 0, 'PrismML binary download failed (check network access).')
     BIN_DIR = DEMO / 'bin/cuda'
     binary = BIN_DIR / 'llama-server'
+    if existing:
+        # A verified server is already running from this very binary. Re-downloading it
+        # would overwrite an executable that is currently mapped (ETXTBSY on Linux) for
+        # no benefit whatsoever: this process was already identified by executable path,
+        # command line and liveness, and its release stamp was verified when it started.
+        ensure(binary.is_file() and os.access(binary, os.X_OK),
+               'The running Bonsai server was started from ' + str(binary) +
+               ', which is now missing — refusing to replace it under a live process.')
+        log('Runtime already installed and running from ' + str(binary) +
+            ' — not overwriting an executable that is in use.')
+    else:
+        log('Fetching official PrismML CUDA binaries via Bonsai-demo '
+            'scripts/download_binaries.sh ...')
+        dl = subprocess.run(['sh', str(DEMO / 'scripts/download_binaries.sh')], cwd=DEMO,
+                            capture_output=True, text=True, timeout=1800)
+        log((dl.stdout + dl.stderr).strip()[-2000:])
+        ensure(dl.returncode == 0, 'PrismML binary download failed (check network access).')
     ensure(binary.is_file() and os.access(binary, os.X_OK),
            'PrismML CUDA llama-server not found — a CPU/other build was selected or the download '
            'failed. Refusing to fall back to CPU. Check nvidia-smi/CUDA driver.')
@@ -902,11 +1241,8 @@ try:
            f'Downloaded file size mismatch: {model.stat().st_size} != {expected_size} (incomplete download).')
     if expected_sha:
         log('Verifying official SHA-256 ...')
-        digest = hashlib.sha256()
-        with model.open('rb') as f:
-            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
-                digest.update(chunk)
-        ensure(digest.hexdigest() == expected_sha, 'Official model SHA-256 mismatch — file corrupted. Aborting.')
+        ensure(sha256_file(model).hexdigest() == expected_sha,
+               'Official model SHA-256 mismatch — file corrupted. Aborting.')
         sha_state = 'PASS (official HF SHA-256)'
     else:
         sha_state = 'unavailable from HF metadata (exact size verified)'
@@ -966,24 +1302,106 @@ try:
            f'GGUF metadata does not identify Ternary Bonsai 2 27B ({meta}, {params/1e9:.2f}B). Aborting — no substitution.')
     log('Integrity: PASS')
 
+    # ---- optional vision projector ------------------------------------------
+    # Opt-in only (BONSAI_VISION=1), never enabled because a file happened to exist,
+    # and never loaded without first counting its VRAM: the projector stays resident
+    # for the life of the server, so a text-only deployment would pay for it on
+    # every single turn.
+    vision_requested = truthy_env('BONSAI_VISION')
+    mmproj = None
+    mmproj_mib = 0.0
+    mmproj_name = None
+    if vision_requested:
+        ensure(supports('--mmproj'),
+               'BONSAI_VISION=1 was requested but this PrismML build does not advertise '
+               '--mmproj. Vision is left OFF rather than silently dropped — unset '
+               'BONSAI_VISION, or use a build with the multimodal projector.')
+        mmproj_name = pick_mmproj(info.siblings, os.environ.get('BONSAI_MMPROJ'))
+        sib = next(x for x in info.siblings if x.rfilename == mmproj_name)
+        mlfs = sib.lfs or {}
+        mmproj_sha = mlfs.get('sha256')
+        mmproj_size = mlfs.get('size') or sib.size
+        ensure(mmproj_size and 200_000_000 < mmproj_size < 3_000_000_000,
+               f'{mmproj_name} has an implausible official size ({mmproj_size}); aborting.')
+        log(f'Vision requested — official projector {mmproj_name} '
+            f'({mmproj_size / 1e9:.2f} GB) counted against the VRAM budget first.')
+        require_capacity(free_mib, existing, extra_mib=mmproj_size / 1024 / 1024)
+        mmproj = Path(hf_hub_download(REPO, mmproj_name, local_dir=str(ROOT / 'models'),
+                                      token=token))
+        ensure(mmproj.is_file() and mmproj.stat().st_size == mmproj_size,
+               f'Downloaded {mmproj_name} size mismatch: {mmproj.stat().st_size} != '
+               f'{mmproj_size} (incomplete download).')
+        if mmproj_sha:
+            ensure(sha256_file(mmproj).hexdigest() == mmproj_sha,
+                   f'{mmproj_name} SHA-256 mismatch — file corrupted. Aborting.')
+            mmproj_state = 'PASS (official HF SHA-256)'
+        else:
+            mmproj_state = 'unavailable from HF metadata (exact size verified)'
+        mmproj_mib = mmproj.stat().st_size / 1024 / 1024
+        log(f'Vision projector verified: {mmproj_state} | {mmproj_mib:.0f} MiB resident')
+    else:
+        log('Vision projector: not downloaded/loaded (text-only serving saves VRAM)')
+
     # ------------------------------------------------------------------
     phase(5, 'Selecting optimized configuration')
+    # ---- opt-in serving knobs -----------------------------------------------
+    # Multi-slot serving is opt-in and never the default: a slot is a whole KV cache,
+    # so N slots split both the context budget and the prompt-cache reuse that makes a
+    # single-user coding session fast. KV4 halves-ish the cache but costs decode speed,
+    # so it is offered as a memory lever and labelled as such.
+    slots = 1
+    try:
+        slots = max(1, min(8, int(os.environ.get('BONSAI_SLOTS') or '1')))
+    except ValueError:
+        slots = 1
+    if slots > 1:
+        ensure(supports('--parallel') or supports('-np'),
+               f'BONSAI_SLOTS={slots} was requested but this build advertises no slot '
+               'flag (--parallel/-np). Refusing to serve an unverified slot count.')
+        log(f'Multi-slot serving ON ({slots} slots, opt-in): each slot carries its own '
+            f'KV cache, so the per-slot context is smaller and prompt-cache reuse is '
+            f'diluted across {slots} independent prefixes. Single-slot remains the '
+            'default for interactive use.')
+    image_max_tokens = DEFAULT_IMAGE_MAX_TOKENS
+    vision_enabled = bool(mmproj)
+    if vision_enabled:
+        try:
+            image_max_tokens = max(256, min(MODEL_MAX_IMAGE_TOKENS,
+                                            int(os.environ.get('BONSAI_IMAGE_MAX_TOKENS')
+                                                or DEFAULT_IMAGE_MAX_TOKENS)))
+        except ValueError:
+            image_max_tokens = DEFAULT_IMAGE_MAX_TOKENS
+    image_reserve = image_context_reserve(image_max_tokens) if vision_enabled else 0
+    kv4 = truthy_env('BONSAI_KV4')
+
     # Starting context: deliberately conservative. The real number is *measured* below —
     # after the server starts, its own log reports the KV buffer it allocated, and from
     # that we derive MiB/token and pick the largest tier that provably fits. Bonsai 2 is a
     # hybrid-attention model (~75% of layers are linear attention), so a fixed
     # bytes-per-token constant would badly underestimate the context it can hold.
     model_mib = model.stat().st_size / 1024 / 1024
-    if len(gpus) >= 2 and min(free_mib[:2]) >= 10000:
+    eff_free = [f - mmproj_mib for f in free_mib]     # the projector is resident too
+    if len(gpus) >= 2 and min(eff_free[:2]) >= 10000:
         ctx = 32768
-    elif free_mib[0] >= 13000:
+    elif eff_free[0] >= 13000:
         ctx = 16384
-    elif free_mib[0] >= 10500:
+    elif eff_free[0] >= 10500:
         ctx = 8192
     else:
         ctx = 8192
+    if slots > 1:
+        ctx = max(CONTEXT_TIERS[0], ctx // slots)
     log(f'Model file {model.name}: {model_mib:.0f} MiB | starting context {ctx} '
         '(refined from the measured KV cost once the server reports it)')
+    if vision_enabled:
+        # Image tokens come out of the same context as text. If the fitted context
+        # cannot hold both, that is a hard failure with a real remedy — not a silent
+        # context shrink and not a silent drop of vision.
+        ensure(ctx - image_reserve >= CONTEXT_TIERS[0],
+               f'Context {ctx} cannot hold {image_reserve} reserved image tokens plus '
+               f'the {CONTEXT_TIERS[0]}-token floor. Vision needs either more free VRAM '
+               'or a smaller BONSAI_IMAGE_MAX_TOKENS; refusing to enable a projector '
+               'that would make every image turn fail.')
     saved_key = state.get('key')
     key = existing['key'] if existing else requested_key or (saved_key if isinstance(saved_key, str) and len(saved_key) >= 32 else secrets.token_urlsafe(32))
     fa = supports('-fa', '--flash-attn')
@@ -1007,21 +1425,48 @@ try:
     if flag_plan.get('parallel') is None:
         pass                                   # no slot flag in this build: leave it alone
     elif supports('--parallel'):
-        args_common += ['--parallel', '1']    # single-user coding API: 1 slot, best cache reuse
+        args_common += ['--parallel', str(slots)]
     else:
-        args_common += ['-np', '1']
+        args_common += ['-np', str(slots)]
+    kv_type_desc = 'runtime default'
+    if kv4:
+        if supports('--cache-type-k'):
+            args_common += ['--cache-type-k', 'q4_0']
+            kv_type_desc = ('q4_0 (BONSAI_KV4=1: roughly 3.5x smaller KV cache, and '
+                            'slightly SLOWER decode — a memory lever, not a speed one)')
+        else:
+            log('BONSAI_KV4=1 was requested but this build does not advertise '
+                '--cache-type-k; leaving the KV type at the runtime default.')
+    if vision_enabled:
+        args_common += ['--mmproj', str(mmproj)]
+        if supports('--image-max-tokens'):
+            args_common += ['--image-max-tokens', str(image_max_tokens)]
+    prompt_cache_desc = ('single slot, prefix reuse enabled' if slots == 1 else
+                         f'{slots} slots, each with its own KV cache and prefix')
     log(f'Context: {ctx} (starting) | Flash Attention: {"ON" if fa else "unavailable"} | '
-        f'slots: 1 | CPU threads planned: {(flag_plan.get("threads") or ["-", "default"])[1]}')
+        f'slots: {slots} | CPU threads planned: {(flag_plan.get("threads") or ["-", "default"])[1]}')
     log('Reasoning: thinking ON, default effort medium (server), per-request override supported')
     log('Speculative decoding: OFF — Bonsai-demo ships no official Bonsai 2 drafter; never faked')
-    log('Vision projector: not downloaded/loaded (text-only serving saves VRAM)')
+    if vision_enabled:
+        log(f'Vision: ON — projector {mmproj_name} ({mmproj_mib:.0f} MiB resident), '
+            f'up to {image_max_tokens} image tokens downscaled per image, '
+            f'{image_max_tokens * IMAGES_PER_TURN} tokens reserved for images')
+    else:
+        log('Vision projector: not downloaded/loaded (text-only serving saves VRAM)')
+    if kv_type_desc != 'runtime default':
+        log('KV cache: ' + kv_type_desc)
 
     def build_cmd(port, ctx_now, extra):
         return [str(binary)] + args_common + ['-c', str(ctx_now), '--port', str(port), '--api-key', key] + extra
 
-    def start_server(extra, logname, ctx_now=None):
-        port = free_port()
+    def start_server(extra, logname, ctx_now=None, port=None):
+        global last_server_log
+        # `port` is a parameter because a supervised restart has to come back on the
+        # SAME port: the public tunnel points at it, and a model restart must never
+        # force the tunnel to be rebuilt (nor vice versa).
+        port = port or free_port()
         logpath = ROOT / logname
+        last_server_log = logpath
         cmd = build_cmd(port, cur_ctx if ctx_now is None else ctx_now, extra)
         shown, skip = [], False
         for tok in cmd:
@@ -1035,7 +1480,7 @@ try:
         with logpath.open('w') as lf:
             proc = subprocess.Popen(cmd, cwd=DEMO, env=env, stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 tail = logpath.read_text(errors='replace')[-2500:]
@@ -1049,9 +1494,9 @@ try:
                        f'Health OK but GPUs hold only {vram_used} MiB — model not resident on GPU. Aborting.')
                 log(f'Healthy. GPU memory in use: {vram_used} MiB (CUDA backend confirmed by VRAM residency).')
                 return proc, port
-            time.sleep(2)
+            time.sleep(POLL_INTERVAL)
         proc.terminate()
-        raise RuntimeError(f'Model startup timed out (15 min). See {logpath}.')
+        raise RuntimeError(f'Model startup timed out ({STARTUP_TIMEOUT:.0f}s). See {logpath}.')
 
     def server_buffers(logname):
         """What the server itself reported allocating, read from its startup log."""
@@ -1108,7 +1553,7 @@ try:
         res = stream_chat(f'http://127.0.0.1:{port}/v1/chat/completions', key,
                           {'model': ALIAS,
                            'messages': [{'role': 'user', 'content': BENCH_PROMPT}],
-                           'max_tokens': 96, 'temperature': 1.0}, timeout=360)
+                           'max_tokens': 96, 'temperature': 1.0}, timeout=360, open_url=URL_OPEN)
         usage = res['usage'] or {}
         ensure(res['first'] and res['chunks'] > 1 and usage.get('completion_tokens', 0) > 1
                and usage.get('prompt_tokens', 0) > 100,
@@ -1136,6 +1581,7 @@ try:
     if not reused:
         split_avail = supports('--split-mode')
         single_extra = ['--split-mode', 'none'] if split_avail else []
+        active_extra = single_extra      # whichever config is live; a restart reuses it
         proc, port, cur_ctx = start_with_recovery(single_extra, 'server-single.log', cur_ctx)
 
         # ---- measured context refinement --------------------------------------
@@ -1146,7 +1592,8 @@ try:
         buffers = server_buffers('server-single.log')
         per_token = kv_mib_per_token(buffers, cur_ctx)
         if per_token:
-            best = choose_context(free_mib, per_token, model_mib, gpus=1)
+            best = choose_context(free_mib, per_token, model_mib, gpus=1,
+                                  slots=slots, extra_mib=mmproj_mib)
             log(f'Measured KV cost: {per_token * 1024:.2f} KiB/token '
                 f'(KV {buffers["kv_mib"]:.0f} MiB at ctx {cur_ctx}, '
                 f'compute {buffers["compute_mib"]:.0f} MiB) -> largest safe tier {best}')
@@ -1261,6 +1708,7 @@ try:
             if dual and dual['output'] > single['output'] * 1.03:
                 selected = f'Dual GPU layer split (+{(dual["output"] / single["output"] - 1) * 100:.1f}% measured decode)'
                 result = dual
+                active_extra = dual_extra
             else:
                 stop(proc)
                 proc, port = start_server(single_extra, 'server-final.log')
@@ -1292,6 +1740,130 @@ try:
     if reused and existing.get('public'):
         active_state.update(public=existing['public'], tunnel_pid=existing.get('tunnel_pid'))
     save_state(STATE, active_state)
+
+    # ------------------------------------------------------------------
+    # Supervision: health-gated liveness, hang detection, bounded restarts.
+    #
+    # Built here and started at the very end, once every real API test has passed, so a
+    # repair can never race the deployment itself. The inference server and the tunnel
+    # get independent budgets because neither may cascade into the other: a model
+    # restart must keep the public URL, and a tunnel restart must not touch the model.
+    # ------------------------------------------------------------------
+    watchdog_log = 'server-watchdog.log'
+    last_server_log = ROOT / 'server-single.log'
+    diag = diagnostics_payload(
+        platform=plat, gpus=[{k: g.get(k) for k in ('index', 'name', 'total', 'free', 'cap',
+                                                    'driver')} for g in gpus],
+        model_file=FILE, model_repo=REPO, packing=band, model_params_b=round(params / 1e9, 2),
+        quantization_verified=True, runtime=str(binary), runtime_stamp=stamp,
+        runtime_version=(version.stdout + version.stderr).strip()[:200],
+        context=cur_ctx, flash_attention=fa, slots=slots, kv_type=kv_type_desc,
+        selected_configuration=selected, context_recovery=recovery_log or None,
+        server_pid=active_state.get('server_pid'), port=port,
+        prompt_cache=prompt_cache_desc, tool_calling=bool(jinja_on),
+        vision=vision_enabled, vision_projector=mmproj_name,
+        image_max_tokens=image_max_tokens if vision_enabled else None,
+        speculative_decoding=False, benchmark=result)
+
+    def write_diagnostics():
+        try:
+            tmp = ROOT / 'diagnostics.json.tmp'
+            tmp.write_text(json.dumps(diag, indent=2, default=str))
+            os.replace(tmp, ROOT / 'diagnostics.json')
+        except OSError as e:
+            log(f'(could not write diagnostics.json: {e})')
+
+    def heartbeat_facts():
+        return dict(version=VERSION, platform=plat, server_pid=active_state.get('server_pid'),
+                    port=port, public=active_state.get('public'), model=FILE,
+                    context=cur_ctx, slots=slots, vision=vision_enabled,
+                    restarts={sup.name: sup.budget.used for sup in supervisors},
+                    last_events=[e for sup in supervisors for e in sup.events[-3:]])
+
+    def record_heal(event):
+        """Every auto-heal is written where a monitor can see it, not just printed."""
+        diag['watchdog'] = [sup.report() for sup in supervisors]
+        diag['last_heal'] = event
+        write_diagnostics()
+        write_heartbeat(ROOT / 'heartbeat.json', heartbeat_facts())
+
+    def server_health():
+        status, body = HTTP(f'http://127.0.0.1:{port}/health', key, timeout=5)
+        return ((status == 200 and isinstance(body, dict) and body.get('status') == 'ok'),
+                f'/health -> {status}')
+
+    def server_probe(timeout):
+        """A real generation that must produce a real token inside `timeout`.
+
+        Health tells us the server is *answering*; only a generation tells us it is
+        still generating. A deadlocked decode keeps /health at 200 forever.
+        """
+        try:
+            res = stream_chat(f'http://127.0.0.1:{port}/v1/chat/completions', key,
+                              {'model': ALIAS, 'max_tokens': 8,
+                               'messages': [{'role': 'user',
+                                             'content': 'Reply with the single word: ok'}]},
+                              timeout=timeout, open_url=URL_OPEN)
+        except Exception as e:
+            return False, f'generation probe failed: {type(e).__name__}: {e}'
+        if res.get('first') is None:
+            return False, f'no token within {timeout:.0f}s (chunks={res.get("chunks")})'
+        return True, f'first token in {(res["first"] - res["t0"]) * 1000:.0f} ms'
+
+    def server_repair(reason, detail):
+        """Restart the model only. Never re-downloads, never touches the tunnel."""
+        global proc, cur_ctx
+        # The log the *outgoing* server wrote, not the one the next one will: the
+        # difference between "it crashed" and "it ran out of memory" decides whether
+        # the context steps down, so it has to come from the right file.
+        try:
+            tail = last_server_log.read_text(errors='replace')[-4000:]
+        except (OSError, AttributeError):
+            tail = ''
+        kind = classify_exit(tail)
+        new_ctx = cur_ctx
+        if kind == 'oom':
+            # OOM is the one case where the configuration, not the process, was wrong:
+            # a smaller KV cache is the fix, so step the ladder down once.
+            ladder = context_ladder(cur_ctx)
+            new_ctx = ladder[1] if len(ladder) > 1 else cur_ctx
+            if new_ctx != cur_ctx:
+                recovery_log.append(new_ctx)
+        stop(proc)
+        proc, live_port = start_server(active_extra, watchdog_log, ctx_now=new_ctx,
+                                       port=port)
+        cur_ctx = new_ctx
+        active_state.update(server_pid=proc.pid, ctx=cur_ctx)
+        diag.update(context=cur_ctx, server_pid=proc.pid,
+                    context_recovery=recovery_log or None)
+        save_state(STATE, active_state)
+        return (f'{kind}: restarted pid {proc.pid} on port {live_port} at context '
+                f'{new_ctx} — API key, state file and tunnel URL preserved')
+
+    def tunnel_repair(reason, detail):
+        """Restart the tunnel only. The inference server is never stopped or restarted."""
+        global tunnel_proc, public
+        if tunnel_proc is not None and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+        tunnel_proc, url = start_tunnel()
+        public = url
+        ok, err = verify_tunnel_connectivity(public, key, request=HTTP, proc=tunnel_proc,
+                                             log_path=tunnel_log)
+        ensure(ok, err)
+        active_state.update(public=public, tunnel_pid=tunnel_proc.pid)
+        diag.update(tunnel_url=public, tunnel_pid=tunnel_proc.pid)
+        save_state(STATE, active_state)
+        return f'tunnel restarted at {public} — the inference server was not touched'
+
+    supervisors = [
+        Supervisor('inference-server', server_health, server_repair,
+                   preserved=(f'API key, port {port}, state.json, the public tunnel URL '
+                              f'and the verified model file (never re-downloaded)'),
+                   on_event=record_heal, probe=server_probe),
+    ]
+
+    write_diagnostics()
+    write_heartbeat(ROOT / 'heartbeat.json', heartbeat_facts())
 
     # ------------------------------------------------------------------
     phase(7, 'Running real API tests')
@@ -1359,7 +1931,7 @@ try:
     try:
         sres = stream_chat(chat_url, key, {'model': ALIAS,
                                            'messages': [{'role': 'user', 'content': 'Count from 1 to 5.'}],
-                                           'max_tokens': 512}, timeout=300)
+                                           'max_tokens': 512}, timeout=300, open_url=URL_OPEN)
         tests['streaming'] = sres['chunks'] >= 3 and bool(sres['text'] + sres['reason'])
     except Exception as e:
         log(f'streaming error: {e}')
@@ -1405,7 +1977,7 @@ try:
     # ------------------------------------------------------------------
     phase(8, 'Starting public tunnel')
     tunnel_bin = ROOT / 'cloudflared'
-    if not tunnel_bin.is_file() or tunnel_bin.stat().st_size < 10_000_000:
+    if not tunnel_bin.is_file() or tunnel_bin.stat().st_size < CLOUDFLARED_MIN_BYTES:
         log('Downloading cloudflared ...')
         tmp_bin = ROOT / 'cloudflared.tmp'
         try:
@@ -1430,7 +2002,7 @@ try:
             log(f'Stored tunnel pid {old_pid} is not a live cloudflared for this '
                 'deployment — starting a fresh tunnel (the inference server is untouched).')
         else:
-            state, detail = tunnel_status(active_state['public'], key, request=http,
+            state, detail = tunnel_status(active_state['public'], key, request=HTTP,
                                           log_path=tunnel_log)
             if state == 'healthy':
                 public = active_state['public']
@@ -1449,13 +2021,13 @@ try:
                                      '--no-autoupdate'], stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
         url = None
-        for _ in range(90):
+        for _ in range(TUNNEL_ATTEMPTS):
             if proc.poll() is not None:
                 break
             url = find_tunnel_url(tunnel_log.read_text(errors='replace'))
             if url:
                 break
-            time.sleep(2)
+            time.sleep(POLL_INTERVAL)
         if not url:
             raise DeploymentError(
                 what='Cloudflare Quick Tunnel did not publish a URL',
@@ -1469,21 +2041,21 @@ try:
     if not public:
         tunnel_proc, public = start_tunnel()
         log(f'Tunnel URL: {public}. Verifying remote tunnel connectivity ...')
-        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http,
+        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=HTTP,
                                                        proc=tunnel_proc, log_path=tunnel_log)
         ensure(ok, err_or_remote)
     else:
-        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http, max_wait=10)
+        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=HTTP, max_wait=10)
         if not ok:
             # The tunnel is the fragile part. Restart it once; never the model.
-            state, detail = tunnel_status(public, key, request=http, proc=tunnel_proc,
+            state, detail = tunnel_status(public, key, request=HTTP, proc=tunnel_proc,
                                           log_path=tunnel_log)
             log(f'Reused tunnel failed verification ({state}: {detail}) — restarting the '
                 'tunnel only; the inference server keeps running.')
             if tunnel_proc is not None and tunnel_proc.poll() is None:
                 tunnel_proc.terminate()
             tunnel_proc, public = start_tunnel()
-            ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http,
+            ok, err_or_remote = verify_tunnel_connectivity(public, key, request=HTTP,
                                                            proc=tunnel_proc,
                                                            log_path=tunnel_log)
             ensure(ok, err_or_remote)
@@ -1494,7 +2066,7 @@ try:
         try:
             rres = stream_chat(public + '/v1/chat/completions', key,
                                {'model': ALIAS, 'messages': [{'role': 'user', 'content': 'Reply with the single word: ok'}],
-                                'max_tokens': 64}, timeout=240)
+                                'max_tokens': 64}, timeout=240, open_url=URL_OPEN)
             if rres and rres.get('chunks', 0) >= 1:
                 chat_ok = True
                 break
@@ -1506,34 +2078,58 @@ try:
                         public=public)
     save_state(STATE, active_state)
 
+    # The tunnel gets its own supervisor and its own budget. A dead cloudflared is the
+    # common case and restarting it must never restart the model; equally, the model
+    # supervisor restarting the server must leave this tunnel alone.
+    def tunnel_health():
+        state, detail = tunnel_status(public, key, request=HTTP, proc=tunnel_proc,
+                                      log_path=tunnel_log)
+        return state == 'healthy', f'{state}: {detail}'
+
+    supervisors.append(
+        Supervisor('cloudflare-tunnel', tunnel_health, tunnel_repair,
+                   preserved=f'the inference server on 127.0.0.1:{port}, its API key '
+                             'and its state file',
+                   on_event=record_heal))
+
     # ------------------------------------------------------------------
     vram_now = [int(r['used']) for r in nvidia_rows()]
-    ram_now_avail = mem_gi('MemAvailable:')
-    final_tunnel_state, final_tunnel_detail = tunnel_status(public, key, request=http)
-    diag = diagnostics_payload(
-        platform=plat, gpus=[{k: g.get(k) for k in ('index', 'name', 'total', 'free', 'cap',
-                                                    'driver')} for g in gpus],
-        model_file=FILE, model_repo=REPO, packing=band, model_params_b=round(params / 1e9, 2),
-        quantization_verified=True, runtime=str(binary), runtime_stamp=stamp,
-        runtime_version=(version.stdout + version.stderr).strip()[:200],
-        context=cur_ctx, flash_attention=fa, slots=1, kv_type='runtime default',
-        selected_configuration=selected,
-        context_recovery=recovery_log or None,
+    ram_now_avail = mem_gi('MemAvailable:', MEMINFO)
+    final_tunnel_state, final_tunnel_detail = tunnel_status(public, key, request=HTTP)
+    diag.update(
         vram_used_mib=vram_now, ram_available_gib=round(ram_now_avail, 1),
-        server_pid=active_state.get('server_pid'), port=port,
         tunnel_pid=active_state.get('tunnel_pid'), tunnel_url=public,
         tunnel_state=final_tunnel_state, tunnel_detail=final_tunnel_detail,
-        prompt_cache='single slot, prefix reuse enabled',
-        tool_calling=bool(jinja_on), vision=False,
-        speculative_decoding=False,
-        benchmark=result, api_tests={k: (v if v == 'SKIP' else bool(v))
-                                     for k, v in tests.items()},
+        slots_state=slot_report(HTTP, local, key),
+        watchdog=[sup.report() for sup in supervisors],
+        api_tests={k: (v if v == 'SKIP' else bool(v)) for k, v in tests.items()},
         client_version=VERSION)
-    try:
-        (ROOT / 'diagnostics.json').write_text(json.dumps(diag, indent=2, default=str))
-        log('\nMachine-readable diagnostics: ' + str(ROOT / 'diagnostics.json'))
-    except OSError as e:
-        log(f'\n(could not write diagnostics.json: {e})')
+    write_diagnostics()
+    log('\nMachine-readable diagnostics: ' + str(ROOT / 'diagnostics.json'))
+
+    # ------------------------------------------------------------------
+    # Supervision runs for as long as this kernel lives. Both components are watched
+    # independently and both are bounded: past the budget they stop and report rather
+    # than flap forever.
+    for sup in supervisors:
+        sup.start()
+    write_heartbeat(ROOT / 'heartbeat.json', heartbeat_facts())
+
+    def heartbeat_loop():
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL)
+            try:
+                write_heartbeat(ROOT / 'heartbeat.json', heartbeat_facts())
+            except Exception:
+                return
+
+    threading.Thread(target=heartbeat_loop, daemon=True,
+                     name='bonsai-heartbeat').start()
+    log(f'\nSupervision: ON — health every {WATCHDOG_INTERVAL:.0f}s, generation probe '
+        f'every {HANG_CHECK_INTERVAL:.0f}s (stall {STALL_TIMEOUT:.0f}s), at most '
+        f'{MAX_RESTARTS} restarts per component per {RESTART_WINDOW / 60:.0f} min.')
+    log('Heartbeat: ' + str(ROOT / 'heartbeat.json') + ' (rewritten every '
+        f'{HEARTBEAT_INTERVAL:.0f}s, so a returning session can prove what is live)')
     log('\n' + '=' * 62)
     log(f'TERNARY BONSAI 2 27B — READY  (Bonsai-Kit v{VERSION})')
     log('=' * 62)
@@ -1543,12 +2139,14 @@ try:
     log(f'\nModel: Ternary Bonsai 2 27B — official {band} GGUF from {REPO}\nVerified: PASS (SHA-256/size/metadata/{params/1e9:.1f}B params)')
     log(f'\nRuntime: PrismML llama.cpp fork (CUDA)\nRelease: {stamp}\nCUDA: {cuda_ver.group(1) if cuda_ver else "?"} | Backend: CUDA | Stock llama.cpp: NOT used (fork kernels required)')
     log(f'\nSelected configuration: {selected}')
-    log(f'Context: {cur_ctx} | Flash Attention: {"ON" if fa else "OFF (unsupported)"} | Slots: 1')
+    log(f'Context: {cur_ctx} | Flash Attention: {"ON" if fa else "OFF (unsupported)"} | '
+        f'Slots: {slots} | KV: {kv_type_desc}')
     log(f'Reasoning: thinking ON, default effort medium. Per request: thinking_budget_tokens '
         '(0=off, N=cap, -1=unlimited) or reasoning_effort (medium|xhigh).')
     if recovery_log:
         log(f'Context recovery steps taken: {" -> ".join(str(c) for c in recovery_log)}')
-    log('Speculative decoding: OFF (no official Bonsai 2 drafter) | Vision projector: not loaded (text-only)')
+    log(f'Speculative decoding: OFF (no official Bonsai 2 drafter) | '
+        f'Vision projector: {"loaded — " + mmproj_name if vision_enabled else "not loaded (text-only)"}')
     log(f'\nReal benchmark (measured on this server):')
     log(f'Input / prefill:  {result["input"]:.1f} tok/s ({result["prompt_tokens"]} prompt tokens)')
     log(f'Output / decode:  {result["output"]:.2f} tok/s')
@@ -1582,6 +2180,9 @@ try:
     log('  -d \'{"model":"ternary-bonsai-2-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}\'')
     log('\nNotes: session-scoped deployment — the API lives while this notebook runtime runs.')
     log('The Quick Tunnel URL is ephemeral; the API key was printed once above — treat notebook output as secret.')
+    log('The server runs in its own process session: an idle browser disconnect, or a '
+        'restarted kernel, leaves it serving. Rerun this cell to reattach to it instead '
+        'of redeploying.')
     log('Model weights are unmodified and licensed Apache-2.0 (prism-ml); this cell never substitutes another model.')
 
 except Exception as exc:

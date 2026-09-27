@@ -1,5 +1,111 @@
 # Changelog
 
+## v0.6.0 — 2026-09-27
+
+Two headline goals, in priority order: **(1) stability** — make the GPU deployment path
+survivable and testable; **(2) feature breadth** — add the missing capability set end to
+end.
+
+The model lock, runtime lock, GPU policy, localhost binding, bearer authentication,
+session schema 2 and the `--doctor --json` shape are all unchanged. Everything in this
+release is additive except two bug fixes, both found by the new harness.
+
+### Stability
+
+- **The deployment path is executed, not just read.** `cell_harness.py` runs the cell's
+  real module-level body offline against fakes: `nvidia-smi` with real per-process VRAM
+  attribution, a CUDA driver compiled from C and driven through the real `ctypes` path, a
+  fake PrismML `llama-server` **executable** (a compiled launcher owns the PID so
+  `/proc/<pid>/exe` and `argv[0]` really are `bin/cuda/llama-server`, which is exactly
+  what the cell's process-identity checks verify), a fake Hugging Face layer with a
+  synthetic 7.21 GB sparse GGUF whose metadata satisfies the identity checks, and a fake
+  `cloudflared` whose published URL is backed by a real loopback proxy so public requests
+  are real HTTP. 73 end-to-end tests; a full deployment reaches READY in ~1 s.
+  The cell gains injectable seams for this — every default is still the real thing.
+- **Supervision.** Two independent watchdogs (inference server, tunnel) with health-gated
+  liveness rather than "is the PID alive", a generation probe that detects a hang by a
+  stall timeout, and restarts bounded in count (3) and rate (per 15 min) with backoff.
+  `classify_exit()` tells crash, OOM and hang apart from the server's own log because the
+  repair differs: an OOM steps the context down the ladder, a crash restarts where it was.
+  A model restart keeps the port, the API key, `state.json` and the tunnel URL, and never
+  re-downloads the model; a tunnel restart leaves the server alone. Neither can cascade.
+  Past the budget, supervision stops and says so. Every heal is recorded in
+  `diagnostics.json`; `heartbeat.json` is rewritten every 60 s.
+- **Session longevity.** Rerun reattaches to a verified server (already in v0.5.0) and
+  now does so *without* re-downloading the runtime.
+
+### Bug fixes found by the harness
+
+- `plan_to_args()` emitted value-less flags. With `--parallel` advertised, the server was
+  launched as `... --parallel -c 8192`, so `-c` was consumed as the flag's value and the
+  server refused to start. Only entries carrying a value are emitted now.
+- A rerun that adopted a live server re-ran `scripts/download_binaries.sh`, overwriting
+  the executable the running server was mapped from (`ETXTBSY`). The runtime is now left
+  alone when a verified server is already up.
+- Regression tests for both (plus one for a GGUF tensor offset above 4 GiB, which the
+  fixture had packed as u32).
+
+### Features — deployment
+
+- **Vision** (`BONSAI_VISION=1`, opt-in): the official `mmproj` from the same repo, same
+  SHA-256/size discipline, VRAM accounted before the server starts, `--image-max-tokens`
+  reserved from the context budget, `--mmproj` passed only when the build advertises it.
+  Refused rather than silently dropped when the build lacks the flag, when the repo
+  publishes no projector, or when the fitted context cannot hold weights + projector +
+  the image reserve.
+- **Multi-slot** (`BONSAI_SLOTS=N`, opt-in): `--parallel N` when advertised, per-slot
+  context = context // slots because each slot carries its own KV cache, and the cost
+  stated in the output. Single slot stays the default.
+- **KV4** (`BONSAI_KV4=1`, opt-in): `--cache-type-k q4_0` when advertised, labelled as a
+  memory lever that costs decode speed. Unavailable is reported, never faked.
+- `/slots` is polled and reported as `slots_state`, or omitted when the runtime does not
+  expose it.
+
+### Features — client
+
+- **Config file + personas** (`config.py`): `--config`, `--save-config`, `--persona`,
+  `--list-personas`, `/config`, `/persona`. Precedence, lowest to highest: defaults →
+  file → persona → environment → the flags you typed. `explicit_args()` re-parses the
+  parser with `argparse.SUPPRESS` defaults, because a default-filled flag would otherwise
+  beat the file. `/config` prints where every value came from.
+- **Conversation branching** (`branches.py`): `/fork`, `/branches`, `/branch`,
+  `/branch del`, `/branch rename`, `--branch`, `--fork`, `--list-branches`. Stored as an
+  extra meta line inside the existing session file: schema 2 is unchanged and still loads
+  everywhere, because the line is skipped by readers that do not know it.
+- **Multi-endpoint** (`endpoints.py`): named endpoints with `api_key_env` (secrets stay in
+  the environment), each with its own client, capability map and token cache.
+- **MCP client** (`mcp.py`): JSON-RPC 2.0 over stdio, stdlib only, the same `mcpServers`
+  shape Claude Desktop uses. Remote tools register into the existing `ToolRegistry` —
+  same approval, timeout and output caps, no second tool-calling mechanism.
+- **Tools start mid-stream**: `ChatStream` announces a tool call the moment its arguments
+  are complete JSON, and the agent runs it on a worker while the model finishes writing
+  the turn. `/pretools on|off`.
+- **Structured output** (`--json-schema`, `/schema`): proved with a real request before
+  use. Honoured, rejected (400) and *ignored* (accepted, then prose) are three outcomes
+  and only the first is support; the capability map is corrected to match.
+- **Budgets** (`budget.py`): `--budget-tokens`, `--budget-turns`,
+  `--budget-prompt-tokens`, `--price-per-mtok`, `/spend`. Counted only from what the
+  server reported; cost stays `n/a` until you supply a price.
+- **Batch mode** (`--batch`, `--out`): the same client, retry policy and tool loop, one
+  conversation per item, a per-item error instead of a crash.
+- **Export** (`--export`, `/export`): JSON and self-contained HTML — no CDN, no external
+  resources, content escaped.
+- **Importable API** (`bonsai_chat.api`): `Bonsai(...)` with `.ask()`, `.stream()`,
+  `.tool()`, `.save()`, `.doctor()`; `run_batch()` / `read_batch()` / `write_batch()`.
+- **No second web UI.** The PrismML runtime already serves one at the server root; a
+  second would be a second renderer and a second auth surface for no new capability.
+
+### Verification
+
+- Tests: **235 → 375**, all offline and deterministic.
+  `test_cell_deployment.py` (73), `test_power_features.py` (67), plus the existing
+  `test_chat_client` (82), `test_streaming_recovery` (94) and `test_deployment` (59).
+- `--selftest`: **20 → 31** checks.
+- `mock_bonsai_server.py`: 26 → **30** scenarios (`structured-json`,
+  `ignore-response-format`, `reject-response-format`, `early-tool-call`).
+- Not verified: the GPU path has still never run against real Bonsai 2 weights on real
+  hardware. See the README's "What has not been verified".
+
 ## v0.5.0 — 2026-09-27
 
 A substantial release focused on streaming reliability, thinking control, latency,

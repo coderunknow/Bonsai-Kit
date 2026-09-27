@@ -99,6 +99,13 @@ SCENARIOS = (
     'reject-effort',       # 400 naming reasoning_effort
     'reject-thinking-budget',   # 400 naming thinking_budget_tokens
     'reject-tools',        # 400 refusing tools (no --jinja)
+    # --- v0.6.0: structured output, the three ways a server can answer it -----------
+    'structured-json',     # honours response_format and replies with valid JSON
+    'ignore-response-format',  # accepts it and answers in prose anyway
+    'reject-response-format',  # 400: unknown field 'response_format'
+    # --- v0.6.0: a tool call whose arguments complete before the turn ends ----------
+    'early-tool-call',     # tool call streamed first, then text, so a mid-stream
+                           # pre-execution has room to overlap the tail
 )
 
 
@@ -252,6 +259,9 @@ class MockBonsaiServer:
                 if scenario == 'reject-tools':
                     return self._send(400, {'error': {
                         'message': 'this server was built without --jinja; tools are unsupported'}})
+                if scenario == 'reject-response-format' and body.get('response_format'):
+                    return self._send(400, {'error': {
+                        'message': "unknown field 'response_format'"}})
                 if scenario == 'invalid-json' and not stream:
                     body_bytes = b'{this is not json'
                     self.send_response(200)
@@ -301,6 +311,14 @@ class MockBonsaiServer:
                                                'function': {'name': 'get_weather',
                                                             'arguments': '{"city": "Lisbon"}'}}]}
                         finish = 'tool_calls'
+                    elif scenario == 'structured-json':
+                        msg = {'role': 'assistant', 'content': '{"ready": true}'}
+                        finish = 'stop'
+                    elif scenario == 'ignore-response-format':
+                        # The field was accepted and then ignored, which is the case a
+                        # naive client would mistake for support.
+                        msg = {'role': 'assistant', 'content': 'Sure, here you go.'}
+                        finish = 'stop'
                     else:
                         msg = {'role': 'assistant', 'content': answer}
                         finish = 'stop'
