@@ -14,12 +14,18 @@
 #         verifies HF SHA-256 + size + GGUF identity/parameter count,
 #         and never touches or converts the weights. No mmproj/vision tower
 #         is downloaded for this text-only API.
-#   [5/8] benchmarks single-GPU vs dual-GPU layer split on real hardware
-#         (never tensor/row split) and picks the measured winner.
+#   [5/8] discovers the tunable flags from `llama-server --help` itself, picks a
+#         context from the KV cost the server *reports* (not a fixed constant),
+#         benchmarks single-GPU vs dual-GPU layer split on real hardware
+#         (never tensor/row split), and runs a bounded autotune of the runtime
+#         knobs it found — cached per GPU/runtime so a rerun does not repeat it.
 #   [6/8] starts the PrismML llama-server OpenAI-compatible API on localhost.
 #   [7/8] real end-to-end tests incl. streaming, auth, model validation,
 #         native tool calling. Prints READY only if every test passes.
-#   [8/8] Cloudflare Quick Tunnel + final report with base URL and API key.
+#   [8/8] Cloudflare Quick Tunnel (treated as disposable: verified, and restarted
+#         on its own if it dies, without ever touching the model) + a final report
+#         with base URL, API key, measured benchmark numbers, the OOM/recovery steps
+#         taken, and a machine-readable diagnostics.json.
 #
 # No mocks, no fallback model, no CPU fallback: if the real model or CUDA
 # runtime cannot be obtained/verified, the cell fails loudly.
@@ -413,6 +419,342 @@ def verify_tunnel_connectivity(public, key, request=http, max_wait=90, interval=
         time.sleep(min(interval, max(0.1, deadline - time.monotonic())))
     return False, f'Remote tunnel API verification failed ({status}: {str(remote)[:300]}).'
 
+VERSION = '0.5.0'
+
+# ======================================================================
+# Structured failures
+#
+# A notebook cell that dies with a 60-frame traceback tells the user nothing. Every
+# failure path below carries the five things that actually help: what failed, why it
+# probably failed, what was preserved, what the cell did by itself, and what the user
+# has to do (usually nothing).
+# ======================================================================
+class DeploymentError(RuntimeError):
+    def __init__(self, what, why='', preserved='', automatic='', action=''):
+        self.what = what
+        self.why = why
+        self.preserved = preserved
+        self.automatic = automatic
+        self.action = action
+        super().__init__(what)
+
+    def report(self):
+        lines = ['WHAT FAILED : ' + self.what]
+        for label, value in (('LIKELY CAUSE', self.why), ('PRESERVED', self.preserved),
+                             ('DONE FOR YOU', self.automatic), ('YOU NEED TO', self.action)):
+            if value:
+                lines.append(f'{label:<12}: ' + value)
+        return '\n'.join(lines)
+
+
+def describe_failure(exc):
+    """Turn any exception into an actionable message. Never invents a cause."""
+    if isinstance(exc, DeploymentError):
+        return exc.report()
+    text = str(exc)
+    low = text.lower()
+    hints = []
+    if 'sha256' in low or 'sha-256' in low or 'size mismatch' in low or 'corrupt' in low:
+        hints.append('The model file is corrupt or incomplete — delete only '
+                     '<workdir>/models and rerun; a valid file is always reused.')
+    if 'out of memory' in low or 'cuda out' in low or 'cudamalloc' in low:
+        hints.append('Not enough VRAM for this context — rerun; the cell steps the '
+                     'context down automatically. Close other GPU consumers yourself; '
+                     'unrelated processes are never killed.')
+    if 'tunnel' in low:
+        hints.append('Check outbound Internet access (Colab: runtime settings; '
+                     'Kaggle: Internet add-on). The inference server itself is '
+                     'unaffected and stays reachable on 127.0.0.1.')
+    if 'hugging' in low or 'unreachable' in low or 'git' in low:
+        hints.append('Enable notebook Internet access and rerun.')
+    if 'api key' in low or 'api_key' in low:
+        hints.append('BONSAI_API_KEY must be >= 32 characters and must match the key a '
+                     'running server was started with.')
+    lines = ['WHAT FAILED : ' + f'{type(exc).__name__}: {text}']
+    if hints:
+        lines.append('YOU NEED TO:')
+        lines += ['  - ' + h for h in hints]
+    return '\n'.join(lines)
+
+
+# ======================================================================
+# Hardware / runtime introspection
+# ======================================================================
+CONTEXT_TIERS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
+MODEL_MAX_CONTEXT = 262144          # Bonsai 2 27B published maximum
+
+
+def gpu_signature(gpus):
+    """A stable key for the current GPU set, used to invalidate cached tuning results."""
+    return '|'.join(f"{g.get('index')}:{g.get('name')}:{g.get('total')}:{g.get('cap')}"
+                    for g in gpus)
+
+
+def parse_buffer_sizes(log_text):
+    """Read llama.cpp's own report of the memory it allocated, in MiB.
+
+    The startup log prints lines like
+        llama_kv_cache_unified:        CUDA0 KV buffer size =  1024.00 MiB
+        llama_context:                 CUDA0 compute buffer size =   295.50 MiB
+    Summing them gives the real per-configuration cost instead of a guessed constant —
+    which matters here because Bonsai 2 is a hybrid-attention model (~75% of its layers
+    are linear attention) so its KV cache is far smaller per token than a dense model's.
+    """
+    kv = compute = 0.0
+    for line in (log_text or '').splitlines():
+        m = re.search(r'KV buffer size\s*=\s*([\d.]+)\s*MiB', line)
+        if m:
+            kv += float(m.group(1))
+            continue
+        m = re.search(r'compute buffer size\s*=\s*([\d.]+)\s*MiB', line)
+        if m:
+            compute += float(m.group(1))
+    return {'kv_mib': round(kv, 2), 'compute_mib': round(compute, 2)}
+
+
+def kv_mib_per_token(buffers, ctx):
+    """Measured MiB of KV cache per token, or None when the log did not report it."""
+    if not ctx or ctx <= 0:
+        return None
+    kv = (buffers or {}).get('kv_mib') or 0.0
+    if kv <= 0:
+        return None
+    return kv / float(ctx)
+
+
+def choose_context(free_mib, per_token_mib, model_mib, overhead_mib=1200.0,
+                   reserve_mib=512.0, tiers=CONTEXT_TIERS, max_context=MODEL_MAX_CONTEXT,
+                   ram_avail_gib=None, gpus=1):
+    """Pick the largest context tier that provably fits, from a measured per-token cost.
+
+    Nothing here assumes a fixed bytes/token figure: the caller passes the KV cost the
+    server actually reported. Without a measurement (`per_token_mib is None`) we fall back
+    to the conservative tiers so a missing log line can never turn into an OOM loop.
+
+    `overhead_mib` covers CUDA context, compute buffers and allocator slack; `reserve_mib`
+    is headroom we refuse to give away, because a server that starts with 20 MiB free
+    dies on the first long prompt.
+    """
+    usable = (min(free_mib) if isinstance(free_mib, (list, tuple)) else free_mib)
+    if not usable or usable <= 0:
+        return tiers[0]
+    # Weights are counted once, not per GPU: a layer split shares them across devices,
+    # so the binding constraint is the *smallest* device's free memory minus its share.
+    share = model_mib / max(1, gpus)
+    budget_mib = max(0.0, usable - share - overhead_mib - reserve_mib)
+    if per_token_mib and per_token_mib > 0:
+        fits = int(budget_mib / per_token_mib)
+        best = tiers[0]
+        for tier in tiers:
+            if tier <= fits and tier <= max_context:
+                best = tier
+        return best
+    # No measurement: conservative fallback, one tier per ~4 GiB of usable headroom.
+    approx = int(budget_mib / 4096)
+    fallback = {0: 4096, 1: 8192, 2: 16384, 3: 32768}.get(min(approx, 3), 32768)
+    return min(fallback, max_context)
+
+
+def context_ladder(ctx, floor=4096):
+    """Descending contexts to try after an OOM. Always terminates; never repeats a value."""
+    ladder, seen = [], set()
+    current = ctx
+    while current >= floor and current not in seen:
+        ladder.append(current)
+        seen.add(current)
+        current //= 2
+    if not ladder or ladder[-1] != floor:
+        ladder.append(floor)
+    return ladder
+
+
+# ======================================================================
+# Runtime flag discovery and bounded autotuning
+# ======================================================================
+#: knobs worth tuning, in priority order. Each entry is only used when llama-server's
+#: own --help advertises the flag; nothing is ever passed blind.
+TUNABLES = (
+    ('flash_attn', ('-fa', '--flash-attn'), 'on'),
+    ('ubatch', ('-ub', '--ubatch-size'), None),
+    ('batch', ('-b', '--batch-size'), None),
+    ('threads', ('-t', '--threads'), None),
+    ('batch_threads', ('-tb', '--threads-batch'), None),
+    ('kv_type', ('--cache-type-k',), None),
+    ('ctx_checkpoints', ('--ctx-checkpoints',), None),
+    ('cache_idle_slots', ('--cache-idle-slots',), ''),
+    ('cache_ram', ('--cache-ram',), None),
+    ('reasoning_budget', ('--reasoning-budget',), None),
+    ('parallel', ('--parallel', '-np'), None),
+)
+
+
+def build_flag_plan(supported_flags, cpu_count=None, ram_avail_gib=None, fa=None):
+    """Choose values for every tunable this runtime actually supports.
+
+    Returns {name: [flag, value] | None}. A `None` value means "supported but we have no
+    evidence a non-default value helps here", and the caller must leave it alone rather
+    than guess — changing a server setting for no reason is exactly what destroys
+    prompt-cache reuse between turns.
+    """
+    plan = {}
+    def has(*flags):
+        return next((f for f in flags if f in supported_flags), None)
+    for name, flags, default in TUNABLES:
+        flag = has(*flags)
+        if flag is None:
+            plan[name] = None
+            continue
+        plan[name] = [flag, default] if default not in (None, '') else [flag]
+    if plan.get('flash_attn') is not None:
+        plan['flash_attn'] = [plan['flash_attn'][0], 'on']
+    if plan.get('ubatch') is not None and cpu_count:
+        plan['ubatch'] = [plan['ubatch'][0], str(min(2048, 512 * max(1, cpu_count // 4)))]
+    if plan.get('batch') is not None and cpu_count:
+        plan['batch'] = [plan['batch'][0], str(min(4096, 1024 * max(1, cpu_count // 4)))]
+    if plan.get('threads') is not None and cpu_count:
+        plan['threads'] = [plan['threads'][0], str(max(1, cpu_count - 2))]
+    if plan.get('batch_threads') is not None and cpu_count:
+        plan['batch_threads'] = [plan['batch_threads'][0], str(max(1, cpu_count - 2))]
+    if plan.get('cache_ram') is not None and ram_avail_gib:
+        plan['cache_ram'] = [plan['cache_ram'][0],
+                             '4096' if ram_avail_gib >= 20 else '2048']
+    return plan
+
+
+def plan_to_args(plan):
+    args = []
+    for name in [t[0] for t in TUNABLES]:
+        entry = plan.get(name)
+        if entry:
+            args += list(entry)
+    return args
+
+
+def tuning_cache_key(gpus, stamp, model_name, version):
+    """Invalidate cached tuning when anything that affects it changes."""
+    return {'gpu': gpu_signature(gpus), 'runtime': stamp, 'model': model_name,
+            'version': version}
+
+
+def load_tuning_cache(path, key):
+    """Return a cached tuning result, or None if the environment has changed.
+
+    Re-benchmarking on every notebook start costs minutes of GPU time; reusing a result
+    measured on different hardware would be worse than not measuring at all. Hence the
+    explicit key comparison, and a corrupt cache is simply ignored.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get('key') != key:
+        return None
+    return data.get('value')
+
+
+def save_tuning_cache(path, key, value):
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        tmp.write_text(json.dumps({'key': key, 'value': value}, indent=2))
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def candidate_configs(plan, ctx, cpus=None):
+    """A small, bounded set of configurations to benchmark. Never a brute-force sweep.
+
+    Three candidates: the conservative default, one with a larger ubatch, one with a
+    smaller one. Each is a real server start plus a real request, so the set is
+    deliberately tiny.
+    """
+    base = plan_to_args(plan)
+    out = [{'name': 'default', 'args': list(base)}]
+    for name, factor in (('ubatch-2x', 2), ('ubatch-half', 0.5)):
+        entry = plan.get('ubatch')
+        if not entry:
+            break
+        try:
+            value = max(128, int(int(entry[1]) * factor))
+        except (TypeError, ValueError):
+            break
+        variant = list(base)
+        idx = variant.index(entry[0])
+        variant[idx + 1] = str(value)
+        out.append({'name': name, 'args': variant})
+    return out
+
+
+# ======================================================================
+# Tunnel resilience
+#
+# The Quick Tunnel is disposable infrastructure. The GPU server behind it is not: nothing
+# in here may restart the model, and nothing here may kill a process it has not verified.
+# ======================================================================
+TUNNEL_BAD_GATEWAY = (502, 503, 520, 521, 522, 523, 524, 525, 526, 530)
+
+
+def tunnel_status(public, key, request, proc=None, log_path=None, timeout=10):
+    """Classify a tunnel: healthy / dead-process / edge-error / unknown.
+
+    Returns (state, detail). `dead-process` is the only state where a restart is safe and
+    useful; an edge 5xx usually just needs another attempt at DNS/edge propagation.
+    """
+    if proc is not None and proc.poll() is not None:
+        tail = ''
+        if log_path and Path(log_path).is_file():
+            tail = Path(log_path).read_text(errors='replace')[-400:]
+        return 'dead-process', f'tunnel process exited (code {proc.poll()}){": " + tail if tail else ""}'
+    status, body = request(public + '/v1/models', key, timeout=timeout)
+    if (status == 200 and isinstance(body, dict) and
+            any(m.get('id') == ALIAS for m in body.get('data', []))):
+        return 'healthy', 'remote /v1/models lists the model alias'
+    if status in TUNNEL_BAD_GATEWAY:
+        return 'edge-error', f'Cloudflare edge returned {status} — the tunnel is up but not routing yet'
+    if status in (401, 403):
+        return 'auth-error', f'tunnel reachable but the API key was rejected ({status})'
+    if status is None:
+        return 'unreachable', f'no response ({str(body)[:160]})'
+    return 'unknown', f'unexpected response {status}: {str(body)[:160]}'
+
+
+def find_tunnel_url(log_text):
+    m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', log_text or '')
+    return m.group(0) if m else None
+
+
+def process_is(pid, binary=None, argv_contains=(), proc_root=Path('/proc')):
+    """Verify a PID is still the process we started before trusting it.
+
+    A PID alone is not identity: notebook runtimes recycle them. Every signal has to
+    match — the executable, the command line, and liveness.
+    """
+    if not pid:
+        return False
+    entry = Path(proc_root) / str(int(pid))
+    try:
+        if binary is not None and Path(os.readlink(entry / 'exe')) != Path(binary):
+            return False
+        argv = (entry / 'cmdline').read_bytes().decode(errors='replace').split('\0')
+        for needle in argv_contains:
+            if needle not in argv:
+                return False
+        return True
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
+# ======================================================================
+# Diagnostics
+# ======================================================================
+def diagnostics_payload(**facts):
+    """Machine-readable deployment state, for `--json`-style monitoring."""
+    payload = {'version': VERSION, 'alias': ALIAS, 'repo': REPO}
+    payload.update({k: v for k, v in facts.items() if v is not None})
+    return payload
+
+
 ROOT = None
 
 try:
@@ -518,9 +860,19 @@ try:
     ensure('--alias' in helptext, 'llama-server build lacks --alias; model-name validation unavailable.')
 
     supported_flags = parse_supported_flags(helptext)
+    cpu_count = os.cpu_count() or 2
 
     def supports(*flags):
         return any(f in supported_flags for f in flags)
+
+    # Every knob below is only used if --help advertised it; nothing is passed blind.
+    flag_plan = build_flag_plan(supported_flags, cpu_count=cpu_count,
+                                ram_avail_gib=ram_avail)
+    tuned = [n for n, v in flag_plan.items() if v]
+    absent = [n for n, v in flag_plan.items() if not v]
+    log(f'Runtime supports: {", ".join(sorted(supported_flags & {f for t in TUNABLES for f in t[1]})) or "none of the tunables"}')
+    log(f'Autotuning: {", ".join(tuned) if tuned else "no tunable flags found"}'
+        + (f' | unavailable: {", ".join(absent)}' if absent else ''))
 
     # ------------------------------------------------------------------
     phase(4, 'Preparing Bonsai 2 27B')
@@ -616,22 +968,33 @@ try:
 
     # ------------------------------------------------------------------
     phase(5, 'Selecting optimized configuration')
-    # Context: conservative tiers (KV is F16, 64 KiB/token). OOM auto-retry halves it.
+    # Starting context: deliberately conservative. The real number is *measured* below —
+    # after the server starts, its own log reports the KV buffer it allocated, and from
+    # that we derive MiB/token and pick the largest tier that provably fits. Bonsai 2 is a
+    # hybrid-attention model (~75% of layers are linear attention), so a fixed
+    # bytes-per-token constant would badly underestimate the context it can hold.
+    model_mib = model.stat().st_size / 1024 / 1024
     if len(gpus) >= 2 and min(free_mib[:2]) >= 10000:
-        ctx = 65536
-    elif free_mib[0] >= 13000:
         ctx = 32768
-    elif free_mib[0] >= 10500:
+    elif free_mib[0] >= 13000:
         ctx = 16384
+    elif free_mib[0] >= 10500:
+        ctx = 8192
     else:
         ctx = 8192
+    log(f'Model file {model.name}: {model_mib:.0f} MiB | starting context {ctx} '
+        '(refined from the measured KV cost once the server reports it)')
     saved_key = state.get('key')
     key = existing['key'] if existing else requested_key or (saved_key if isinstance(saved_key, str) and len(saved_key) >= 32 else secrets.token_urlsafe(32))
     fa = supports('-fa', '--flash-attn')
     jinja_on = supports('--jinja')
     args_common = ['-m', str(model), '--alias', ALIAS, '--host', '127.0.0.1', '-ngl', '99']
-    if fa:
-        args_common += ['-fa', 'on']
+    # Autotuned, capability-gated knobs (flash attention, ubatch/batch, threads,
+    # KV type, prompt-cache settings). A knob we have no evidence for is left at the
+    # runtime default on purpose: changing server settings for no reason is what breaks
+    # prompt-cache reuse between turns of a long coding session.
+    args_common += plan_to_args(flag_plan)
+    fa = flag_plan.get('flash_attn') is not None
     for flag, val in (('--temp', '1.0'), ('--top-p', '0.95'), ('--top-k', '20'), ('--min-p', '0.05')):
         if supports(flag):
             args_common += [flag, val]
@@ -641,18 +1004,14 @@ try:
             # Official guidance: medium reasoning effort as the interactive API default;
             # requests can still ask for stronger effort. Thinking stays enabled.
             args_common += ['--chat-template-kwargs', '{"reasoning_effort":"medium"}']
-    if supports('--parallel'):
-        args_common += ['--parallel', '1']   # single-user coding API: 1 slot, best prompt-cache reuse
-    elif supports('-np'):
+    if flag_plan.get('parallel') is None:
+        pass                                   # no slot flag in this build: leave it alone
+    elif supports('--parallel'):
+        args_common += ['--parallel', '1']    # single-user coding API: 1 slot, best cache reuse
+    else:
         args_common += ['-np', '1']
-    # Prompt-cache tuning for long multi-turn coding sessions (Bonsai-demo PROMPT-CACHE.md).
-    if supports('--ctx-checkpoints'):
-        args_common += ['--ctx-checkpoints', '32']
-    if supports('--cache-idle-slots'):
-        args_common += ['--cache-idle-slots']
-    if supports('--cache-ram') and ram_avail >= 11:
-        args_common += ['--cache-ram', '4096' if ram_total >= 20 else '2048']
-    log(f'Context: {ctx} | Flash Attention: {"ON" if fa else "unavailable"} | slots: 1 | KV: F16')
+    log(f'Context: {ctx} (starting) | Flash Attention: {"ON" if fa else "unavailable"} | '
+        f'slots: 1 | CPU threads planned: {(flag_plan.get("threads") or ["-", "default"])[1]}')
     log('Reasoning: thinking ON, default effort medium (server), per-request override supported')
     log('Speculative decoding: OFF — Bonsai-demo ships no official Bonsai 2 drafter; never faked')
     log('Vision projector: not downloaded/loaded (text-only serving saves VRAM)')
@@ -660,10 +1019,10 @@ try:
     def build_cmd(port, ctx_now, extra):
         return [str(binary)] + args_common + ['-c', str(ctx_now), '--port', str(port), '--api-key', key] + extra
 
-    def start_server(extra, logname):
+    def start_server(extra, logname, ctx_now=None):
         port = free_port()
         logpath = ROOT / logname
-        cmd = build_cmd(port, cur_ctx, extra)
+        cmd = build_cmd(port, cur_ctx if ctx_now is None else ctx_now, extra)
         shown, skip = [], False
         for tok in cmd:
             if skip:
@@ -693,6 +1052,41 @@ try:
             time.sleep(2)
         proc.terminate()
         raise RuntimeError(f'Model startup timed out (15 min). See {logpath}.')
+
+    def server_buffers(logname):
+        """What the server itself reported allocating, read from its startup log."""
+        try:
+            return parse_buffer_sizes((ROOT / logname).read_text(errors='replace'))
+        except OSError:
+            return {'kv_mib': 0.0, 'compute_mib': 0.0}
+
+    def start_with_recovery(extra, logname, ctx_start):
+        """Start the server, stepping the context down on OOM until it fits or we run out.
+
+        Bounded by construction: `context_ladder` is finite and strictly decreasing, so
+        this cannot loop. Only the server this cell started is ever stopped.
+        """
+        attempts = []
+        for candidate in context_ladder(ctx_start):
+            try:
+                proc, port = start_server(extra, logname, ctx_now=candidate)
+                if attempts:
+                    log(f'Server started at context {candidate} after '
+                        f'{len(attempts)} OOM recovery step(s): '
+                        + ' -> '.join(str(a) for a in attempts + [candidate]))
+                recovery_log.extend(attempts + ([candidate] if attempts else []))
+                return proc, port, candidate
+            except OomError as e:
+                attempts.append(candidate)
+                log(f'OOM at context {candidate} — '
+                    f'{"stepping down" if candidate > 4096 else "no smaller tier left"}.')
+        raise DeploymentError(
+            what=f'The server could not start at any context down to {attempts[-1]} tokens',
+            why='the model plus the smallest KV cache do not fit the free VRAM',
+            preserved='the downloaded, SHA-256-verified model file and the PrismML runtime',
+            automatic='context was stepped down through ' + ' -> '.join(str(a) for a in attempts),
+            action='free VRAM (stop other GPU work yourself — unrelated processes are never '
+                   'killed) and rerun the cell')
 
     def stop(proc):
         if proc is not None and proc.poll() is None:
@@ -728,6 +1122,7 @@ try:
 
     # The process was verified before the free-VRAM gate, so an existing model
     # does not get mistaken for an unrelated GPU consumer on notebook reruns.
+    recovery_log = []
     reused = existing is not None
     if reused:
         proc, port = None, existing['port']
@@ -741,15 +1136,105 @@ try:
     if not reused:
         split_avail = supports('--split-mode')
         single_extra = ['--split-mode', 'none'] if split_avail else []
-        try:
-            proc, port = start_server(single_extra, 'server-single.log')
-        except OomError:
-            ensure(cur_ctx > 8192, 'Server OOM at minimum context; hardware cannot serve this model safely.')
-            log(f'OOM detected — halving context {cur_ctx} -> {cur_ctx // 2} and retrying once.')
-            cur_ctx //= 2
-            proc, port = start_server(single_extra, 'server-single.log')
+        proc, port, cur_ctx = start_with_recovery(single_extra, 'server-single.log', cur_ctx)
+
+        # ---- measured context refinement --------------------------------------
+        # Now that a server is actually running we know the real KV cost per token. If
+        # that says a materially larger context fits, restart once at the better value;
+        # if the bigger context OOMs, the ladder brings us back down. One upgrade attempt
+        # maximum, so this can never turn into a restart loop.
+        buffers = server_buffers('server-single.log')
+        per_token = kv_mib_per_token(buffers, cur_ctx)
+        if per_token:
+            best = choose_context(free_mib, per_token, model_mib, gpus=1)
+            log(f'Measured KV cost: {per_token * 1024:.2f} KiB/token '
+                f'(KV {buffers["kv_mib"]:.0f} MiB at ctx {cur_ctx}, '
+                f'compute {buffers["compute_mib"]:.0f} MiB) -> largest safe tier {best}')
+            if best > cur_ctx:
+                log(f'Restarting once at the larger measured context {cur_ctx} -> {best} ...')
+                keep = cur_ctx
+                stop(proc)
+                try:
+                    proc, port = start_server(single_extra, 'server-single.log', ctx_now=best)
+                    cur_ctx = best
+                    log(f'Context raised to {best} tokens on measured evidence.')
+                except (OomError, RuntimeError) as e:
+                    log(f'Context {best} did not hold ({str(e)[:200]}) — recovering at {keep}.')
+                    proc, port, cur_ctx = start_with_recovery(single_extra, 'server-single.log', keep)
+        else:
+            log('The server log did not report a KV buffer size; keeping the conservative '
+                f'context {cur_ctx} rather than guessing a per-token cost.')
+
         log('Benchmarking single-GPU configuration (real Bonsai 2 request) ...')
         single = benchmark(port)
+
+        # ---- bounded autotuning of the runtime knobs this build supports ----------
+        # Two extra candidates at most (a larger and a smaller ubatch), each a real
+        # server start and a real request. Cached against a key of GPU + runtime stamp +
+        # model + version so a rerun on unchanged hardware does not pay for it again, and
+        # any failure falls back to the default configuration instead of failing the
+        # deployment.
+        tune_key = tuning_cache_key(gpus, stamp, FILE, VERSION)
+        cache_path = ROOT / 'tuning.json'
+        cached = load_tuning_cache(cache_path, tune_key)
+        if os.environ.get('BONSAI_TUNE', '1') == '0':
+            log('Autotuning skipped (BONSAI_TUNE=0).')
+        elif flag_plan.get('ubatch') is None:
+            log('Autotuning skipped: this runtime exposes no ubatch knob to tune.')
+        elif cached:
+            chosen = cached.get('name', 'default')
+            log(f'Reusing cached tuning result for this hardware/runtime: {chosen} '
+                f'(decode {cached.get("decode", 0):.2f} tok/s).')
+            if chosen != 'default':
+                variant = next((c for c in candidate_configs(flag_plan, cur_ctx)
+                                if c['name'] == chosen), None)
+                if variant:
+                    stop(proc)
+                    try:
+                        proc, port = start_server(single_extra + variant['args'],
+                                                  'server-tuned.log', ctx_now=cur_ctx)
+                        single = cached.get('bench') or benchmark(port)
+                        # Remember it so the later dual-GPU probe and the final server
+                        # start with the same knobs; done after the start so the args are
+                        # not applied twice.
+                        args_common += variant['args']
+                    except Exception as e:
+                        log(f'Cached tuning config {chosen} failed to start '
+                            f'({str(e)[:200]}) — falling back to the default configuration.')
+                        proc, port = start_server(single_extra, 'server-final.log',
+                                                  ctx_now=cur_ctx)
+                        save_tuning_cache(cache_path, tune_key,
+                                          {'name': 'default', 'decode': single['output'],
+                                           'bench': single})
+        else:
+            log('Autotuning: benchmarking a bounded candidate set (this restarts the '
+                'server per candidate) ...')
+            best_cfg, best_bench = 'default', single
+            for cand in candidate_configs(flag_plan, cur_ctx)[1:]:
+                stop(proc)
+                try:
+                    proc, port = start_server(single_extra + cand['args'],
+                                              f'server-tune-{cand["name"]}.log',
+                                              ctx_now=cur_ctx)
+                    res = benchmark(port)
+                    log(f'  {cand["name"]}: decode {res["output"]:.2f} tok/s | '
+                        f'prefill {res["input"]:.1f} tok/s | TTFT {res["ttft"]:.0f} ms')
+                    if res['output'] > best_bench['output'] * 1.02:
+                        best_cfg, best_bench = cand['name'], res
+                except Exception as e:
+                    log(f'  {cand["name"]}: rejected ({str(e)[:180]})')
+            if best_cfg != 'default':
+                variant = next(c for c in candidate_configs(flag_plan, cur_ctx)
+                               if c['name'] == best_cfg)
+                stop(proc)
+                proc, port = start_server(single_extra + variant['args'],
+                                          'server-tuned.log', ctx_now=cur_ctx)
+                single = best_bench
+                args_common += variant['args']   # after the start: never applied twice
+            log(f'Autotuning selected: {best_cfg}')
+            save_tuning_cache(cache_path, tune_key,
+                              {'name': best_cfg, 'decode': best_bench['output'],
+                               'bench': best_bench})
         vram_single = [int(r['used']) for r in nvidia_rows()]
         log(f'Single GPU: decode {single["output"]:.2f} tok/s | prefill {single["input"]:.1f} tok/s | '
             f'TTFT {single["ttft"]:.0f} ms | VRAM MiB {vram_single}')
@@ -934,42 +1419,74 @@ try:
     tunnel_bin.chmod(0o700)
     tunnel_proc = None
     public = None
+    tunnel_log = ROOT / 'tunnel.log'
+
+    # Reuse a tunnel only after verifying both that the PID is still *our* cloudflared
+    # (PIDs get recycled) and that the edge actually routes to the model. A tunnel is
+    # disposable; the GPU server behind it is not, so nothing here may touch the model.
     if active_state.get('tunnel_pid') and active_state.get('public'):
         old_pid = active_state['tunnel_pid']
-        try:
-            os.kill(old_pid, 0)
-            status, remote = http(active_state['public'] + '/v1/models', key, timeout=10)
-            if (status == 200 and isinstance(remote, dict) and
-                    any(m.get('id') == ALIAS for m in remote.get('data', []))):
+        if not process_is(old_pid, binary=tunnel_bin, argv_contains=('tunnel', '--url')):
+            log(f'Stored tunnel pid {old_pid} is not a live cloudflared for this '
+                'deployment — starting a fresh tunnel (the inference server is untouched).')
+        else:
+            state, detail = tunnel_status(active_state['public'], key, request=http,
+                                          log_path=tunnel_log)
+            if state == 'healthy':
                 public = active_state['public']
                 log('Reusing existing healthy tunnel.')
             else:
+                log(f'Stored tunnel is {state} ({detail}) — restarting the tunnel only.')
                 try:
                     os.kill(old_pid, 15)
                 except OSError:
                     pass
-        except OSError:
-            public = None
-    if not public:
-        tunnel_log = ROOT / 'tunnel.log'
+
+    def start_tunnel():
+        """Start a fresh Quick Tunnel and wait for the URL to appear in its log."""
         with tunnel_log.open('w') as lf:
-            tunnel_proc = subprocess.Popen([str(tunnel_bin), 'tunnel', '--url', local, '--no-autoupdate'],
-                                           stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = subprocess.Popen([str(tunnel_bin), 'tunnel', '--url', local,
+                                     '--no-autoupdate'], stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        url = None
         for _ in range(90):
-            if tunnel_proc.poll() is not None:
+            if proc.poll() is not None:
                 break
-            m = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', tunnel_log.read_text(errors='replace'))
-            if m:
-                public = m.group(0)
+            url = find_tunnel_url(tunnel_log.read_text(errors='replace'))
+            if url:
                 break
             time.sleep(2)
-        ensure(public, 'Cloudflare tunnel failed to start: ' + (ROOT / 'tunnel.log').read_text(errors='replace')[-1200:])
+        if not url:
+            raise DeploymentError(
+                what='Cloudflare Quick Tunnel did not publish a URL',
+                why=tunnel_log.read_text(errors='replace')[-600:],
+                preserved=f'the inference server, live on {local}',
+                automatic='nothing further — the model is still usable locally',
+                action='check outbound Internet access, then rerun the cell; the running '
+                       'server will be reused rather than restarted')
+        return proc, url
+
+    if not public:
+        tunnel_proc, public = start_tunnel()
         log(f'Tunnel URL: {public}. Verifying remote tunnel connectivity ...')
-        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http, proc=tunnel_proc, log_path=tunnel_log)
+        ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http,
+                                                       proc=tunnel_proc, log_path=tunnel_log)
         ensure(ok, err_or_remote)
     else:
         ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http, max_wait=10)
-        ensure(ok, err_or_remote)
+        if not ok:
+            # The tunnel is the fragile part. Restart it once; never the model.
+            state, detail = tunnel_status(public, key, request=http, proc=tunnel_proc,
+                                          log_path=tunnel_log)
+            log(f'Reused tunnel failed verification ({state}: {detail}) — restarting the '
+                'tunnel only; the inference server keeps running.')
+            if tunnel_proc is not None and tunnel_proc.poll() is None:
+                tunnel_proc.terminate()
+            tunnel_proc, public = start_tunnel()
+            ok, err_or_remote = verify_tunnel_connectivity(public, key, request=http,
+                                                           proc=tunnel_proc,
+                                                           log_path=tunnel_log)
+            ensure(ok, err_or_remote)
 
     chat_ok = False
     last_chat_err = None
@@ -991,8 +1508,34 @@ try:
 
     # ------------------------------------------------------------------
     vram_now = [int(r['used']) for r in nvidia_rows()]
+    ram_now_avail = mem_gi('MemAvailable:')
+    final_tunnel_state, final_tunnel_detail = tunnel_status(public, key, request=http)
+    diag = diagnostics_payload(
+        platform=plat, gpus=[{k: g.get(k) for k in ('index', 'name', 'total', 'free', 'cap',
+                                                    'driver')} for g in gpus],
+        model_file=FILE, model_repo=REPO, packing=band, model_params_b=round(params / 1e9, 2),
+        quantization_verified=True, runtime=str(binary), runtime_stamp=stamp,
+        runtime_version=(version.stdout + version.stderr).strip()[:200],
+        context=cur_ctx, flash_attention=fa, slots=1, kv_type='runtime default',
+        selected_configuration=selected,
+        context_recovery=recovery_log or None,
+        vram_used_mib=vram_now, ram_available_gib=round(ram_now_avail, 1),
+        server_pid=active_state.get('server_pid'), port=port,
+        tunnel_pid=active_state.get('tunnel_pid'), tunnel_url=public,
+        tunnel_state=final_tunnel_state, tunnel_detail=final_tunnel_detail,
+        prompt_cache='single slot, prefix reuse enabled',
+        tool_calling=bool(jinja_on), vision=False,
+        speculative_decoding=False,
+        benchmark=result, api_tests={k: (v if v == 'SKIP' else bool(v))
+                                     for k, v in tests.items()},
+        client_version=VERSION)
+    try:
+        (ROOT / 'diagnostics.json').write_text(json.dumps(diag, indent=2, default=str))
+        log('\nMachine-readable diagnostics: ' + str(ROOT / 'diagnostics.json'))
+    except OSError as e:
+        log(f'\n(could not write diagnostics.json: {e})')
     log('\n' + '=' * 62)
-    log('TERNARY BONSAI 2 27B — READY')
+    log(f'TERNARY BONSAI 2 27B — READY  (Bonsai-Kit v{VERSION})')
     log('=' * 62)
     log(f'Platform: {plat}')
     log('GPU(s): ' + ', '.join(f"{g['name']} ({int(g['total'])/1024:.1f} GiB)" for g in gpus))
@@ -1000,8 +1543,11 @@ try:
     log(f'\nModel: Ternary Bonsai 2 27B — official {band} GGUF from {REPO}\nVerified: PASS (SHA-256/size/metadata/{params/1e9:.1f}B params)')
     log(f'\nRuntime: PrismML llama.cpp fork (CUDA)\nRelease: {stamp}\nCUDA: {cuda_ver.group(1) if cuda_ver else "?"} | Backend: CUDA | Stock llama.cpp: NOT used (fork kernels required)')
     log(f'\nSelected configuration: {selected}')
-    log(f'Context: {cur_ctx} | Flash Attention: {"ON" if fa else "OFF (unsupported)"} | KV: F16 | Slots: 1')
-    log('Reasoning: thinking ON (default effort: medium; request can ask for stronger)')
+    log(f'Context: {cur_ctx} | Flash Attention: {"ON" if fa else "OFF (unsupported)"} | Slots: 1')
+    log(f'Reasoning: thinking ON, default effort medium. Per request: thinking_budget_tokens '
+        '(0=off, N=cap, -1=unlimited) or reasoning_effort (medium|xhigh).')
+    if recovery_log:
+        log(f'Context recovery steps taken: {" -> ".join(str(c) for c in recovery_log)}')
     log('Speculative decoding: OFF (no official Bonsai 2 drafter) | Vision projector: not loaded (text-only)')
     log(f'\nReal benchmark (measured on this server):')
     log(f'Input / prefill:  {result["input"]:.1f} tok/s ({result["prompt_tokens"]} prompt tokens)')
@@ -1023,11 +1569,13 @@ try:
     log(')')
     log('print(response.choices[0].message.content)')
     log('\nChat client bundled in this repo (interactive loop, Markdown, tool calling, image facts):')
-    log('  git clone https://github.com/coderunknow/TB-2-27b && cd TB-2-27b')
+    log('  git clone https://github.com/coderunknow/Bonsai-Kit && cd Bonsai-Kit')
     log(f'  export BONSAI_BASE_URL={public}/v1')
     log(f'  export BONSAI_API_KEY={key}')
-    log('  python3 bonsai_chat.py --doctor   # verify this endpoint end to end')
-    log('  python3 bonsai_chat.py            # start chatting (stdlib only, no pip installs)')
+    log('  python3 bonsai_chat.py --doctor --json   # machine-readable endpoint diagnostics')
+    log('  python3 bonsai_chat.py --benchmark       # measure TTFT / prefill / decode here')
+    log('  python3 bonsai_chat.py                   # start chatting (stdlib only, no pip installs)')
+    log('  # thinking control without restarting anything: /think off|low|medium|high|max')
     log('\ncurl example:')
     log(f'curl {public}/v1/chat/completions \\')
     log(f'  -H "Authorization: Bearer {key}" -H "Content-Type: application/json" \\')
@@ -1037,21 +1585,14 @@ try:
     log('Model weights are unmodified and licensed Apache-2.0 (prism-ml); this cell never substitutes another model.')
 
 except Exception as exc:
-    log('\nDEPLOYMENT FAILED: ' + type(exc).__name__ + ': ' + str(exc))
-    hints = []
-    s = str(exc)
-    if 'sha256' in s.lower() or 'size mismatch' in s.lower():
-        hints.append('Model file corrupted — delete the models dir under the work dir and rerun.')
-    if 'tunnel' in s.lower():
-        hints.append('Check outbound Internet access (Colab: Runtime settings; Kaggle: Internet add-on).')
-    if 'cuda' in s.lower() or 'gpu' in s.lower():
-        hints.append('Verify a GPU runtime is selected and nvidia-smi works in this notebook.')
-    if 'hugging' in s.lower() or 'unreachable' in s.lower() or 'git' in s.lower():
-        hints.append('Enable notebook Internet access and rerun.')
-    if 'OOM' in s or 'out of memory' in s.lower():
-        hints.append('Rerun; the cell halves context on OOM automatically. Close other GPU consumers.')
-    for h in hints:
-        log('Hint: ' + h)
+    # Structured, actionable failure reporting. A 60-frame traceback tells a notebook
+    # user nothing; this states what failed, what was preserved, and what to do.
+    log('\n' + '=' * 62)
+    log('DEPLOYMENT FAILED')
+    log('=' * 62)
+    log(describe_failure(exc))
     if ROOT is not None:
-        log('Server/runtime logs: ' + str(ROOT) + ' (server-single.log / server-dual.log / server-final.log / tunnel.log)')
+        log('\nLogs kept for inspection in ' + str(ROOT) + ':')
+        log('  server-single.log  server-dual.log  server-final.log  server-tuned.log  tunnel.log')
+    log('Nothing unrelated was stopped: only processes this cell started and verified.')
     raise

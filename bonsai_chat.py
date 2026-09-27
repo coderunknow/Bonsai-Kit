@@ -13,7 +13,13 @@ The deployment cell (colab_kaggle_cell.py) prints a base URL + bearer key and a 
     pixels are sent, if it is text-only (the default deployment) the client extracts real
     facts about the file — format, dimensions, Pillow stats, optional OCR — and sends those
   * native tool calling: a registry of sandboxed tools the model can call, with an
-    approve/deny flow, parallel calls, and an automatic tool-result loop
+    approve/deny flow, parallel calls, bounded rounds/time/output, and an automatic
+    tool-result loop
+  * thinking control: /think off|low|medium|high|max maps onto the runtime's real
+    `thinking_budget_tokens` field, and /effort onto `reasoning_effort` — both confirmed
+    against the server rather than assumed, so nothing unsupported is ever advertised
+  * measured diagnostics: --doctor [--json], --benchmark, /stats and /caps report only
+    numbers that were actually measured, and say `n/a` when they were not
 
 Standard library only. `rich`, `pillow`, `pygments` and `pytesseract` are used when they are
 importable and silently skipped when they are not, so the file runs unchanged on Colab,
@@ -26,6 +32,9 @@ Usage:
     python3 bonsai_chat.py -p "why is C++ fast"  # one-shot
     cat notes.txt | python3 bonsai_chat.py -p "summarise"
     python3 bonsai_chat.py --selftest            # protocol self-test against a local stub
+    python3 bonsai_chat.py --mock                # try the whole client with no deployment
+    python3 bonsai_chat.py --doctor --json       # machine-readable endpoint diagnostics
+    python3 bonsai_chat.py --benchmark           # measure TTFT, prefill and decode speed
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import http.client
 import io
 import json
 import mimetypes
@@ -42,10 +52,12 @@ import shutil
 import signal
 import socket
 import ssl
+import statistics
 import struct
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,8 +65,19 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = '0.3.0'
+VERSION = '0.5.0'
 DEFAULT_MODEL = 'ternary-bonsai-2-27b'
+
+# How the streaming renderer decides to flush: write immediately when enough text has
+# piled up, otherwise wait at most this long. Flushing per token costs a write(2) per
+# token (measured: several hundred syscalls/second on a fast stream); coalescing keeps
+# the output visually real-time at a small fraction of the syscall count.
+FLUSH_MIN_CHARS = 24
+FLUSH_MAX_DELAY = 0.033          # ~30 Hz — imperceptible, and far below terminal refresh cost
+
+# Streaming output that has to survive a torn connection: a partial answer is reported
+# as partial, never silently promoted to a finished assistant turn.
+MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024
 
 # Optional integrations — every one of these is a nicety, never a requirement.
 try:  # pragma: no cover - depends on environment
@@ -119,6 +142,41 @@ class BonsaiAPIError(BonsaiError):
 
 class CancelledByUser(Exception):
     """Raised when Ctrl-C interrupts the current turn (the session survives)."""
+
+
+class TransportError(BonsaiError):
+    """The HTTP layer could not complete a call. `request_sent` drives retry safety.
+
+    A chat POST that the server may already be generating for must not be replayed
+    blindly: doing so doubles the work and can hand the user a duplicated answer.
+    So the transport records how far the request got, and only "never left this
+    process" failures are retried automatically for non-idempotent calls.
+    """
+
+    #: request phases, in order; retry is safe for a POST only up to `sent=False`
+    def __init__(self, message, url='', request_sent=False, phase='connect'):
+        self.url = url
+        self.request_sent = request_sent
+        self.phase = phase
+        super().__init__(message)
+
+    @property
+    def safe_to_retry_post(self):
+        return not self.request_sent
+
+
+class StreamInterrupted(BonsaiError):
+    """The server stopped mid-generation. Carries whatever did arrive."""
+
+    def __init__(self, message, partial_text='', partial_reasoning='', reason=''):
+        self.partial_text = partial_text
+        self.partial_reasoning = partial_reasoning
+        self.reason = reason
+        super().__init__(message)
+
+
+class CapabilityError(BonsaiError):
+    """A requested feature is not supported by this server build."""
 
 
 # ======================================================================
@@ -238,36 +296,129 @@ def normalize_base_url(base_url: str) -> str:
     return url
 
 
+class SSEDecoder:
+    """Incremental Server-Sent-Events decoder that survives fragmented network reads.
+
+    Real tunnels hand us arbitrary byte boundaries: an event can be split anywhere, a
+    keep-alive comment can arrive alone, and a `data:` field can span several lines.
+    The decoder buffers bytes, splits on LF/CRLF, strips exactly one leading space after
+    `data:` (per the SSE spec), joins multi-line data with newlines, ignores `:` comments
+    and unknown fields, and dispatches an event on each blank line. A final unterminated
+    event is emitted by `close()` so a server that disconnects without a trailing blank
+    line does not swallow the last chunk.
+    """
+
+    def __init__(self, max_event_bytes=MAX_SSE_EVENT_BYTES):
+        self._buf = b''
+        self._data = []
+        self._bytes = 0
+        self.max_event_bytes = max_event_bytes
+        self.events = 0
+        self.comments = 0
+        self.malformed = 0
+        self.bytes_seen = 0
+
+    # ------------------------------------------------------------------
+    def feed(self, chunk):
+        """Feed raw bytes; yield every complete event payload."""
+        if isinstance(chunk, str):
+            chunk = chunk.encode('utf-8')
+        if not chunk:
+            return
+        self.bytes_seen += len(chunk)
+        self._buf += chunk
+        while True:
+            idx = self._buf.find(b'\n')
+            if idx < 0:
+                break
+            line = self._buf[:idx]
+            self._buf = self._buf[idx + 1:]
+            if line.endswith(b'\r'):
+                line = line[:-1]
+            payload = self._line(line.decode('utf-8', 'replace'))
+            if payload is not None:
+                yield payload
+        if len(self._buf) > self.max_event_bytes:
+            # A runaway line (never any \n) is a broken stream, not a huge token.
+            raise StreamInterrupted(f'SSE line exceeded {self.max_event_bytes} bytes without a '
+                                    'newline — treating the stream as corrupt',
+                                    reason='oversized-line')
+
+    def _line(self, line):
+        """Handle one SSE line. Returns an event payload string or None."""
+        if line == '':
+            return self._dispatch()
+        if line.startswith(':'):
+            self.comments += 1
+            return None
+        field, _, value = line.partition(':')
+        if value.startswith(' '):
+            value = value[1:]          # exactly one leading space, per spec
+        if field == 'data':
+            self._data.append(value)
+            self._bytes += len(value) + 1
+            if self._bytes > self.max_event_bytes:
+                raise StreamInterrupted('SSE event exceeded the size limit', reason='oversized-event')
+        # `event:`, `id:`, `retry:` and anything else are accepted and ignored.
+        return None
+
+    def _dispatch(self):
+        if not self._data:
+            return None
+        payload = '\n'.join(self._data)
+        self._data = []
+        self._bytes = 0
+        self.events += 1
+        return payload
+
+    def close(self):
+        """Flush a trailing event left over by a truncated stream."""
+        tail = self._buf
+        self._buf = b''
+        if tail:
+            line = tail.decode('utf-8', 'replace')
+            if line.endswith('\r'):
+                line = line[:-1]
+            self._line(line)
+        return self._dispatch()
+
+
 def iter_sse_events(resp):
     """Yield the payload of each `data:` event from a streaming HTTP response.
 
-    Handles multi-line data fields, CRLF, and SSE comment keep-alives.
+    Handles multi-line data fields, CRLF, SSE comment keep-alives, and reads that arrive
+    split at arbitrary byte boundaries. Kept as a generator over any iterable of chunks
+    or lines so it stays directly unit-testable.
     """
-    data_lines = []
+    decoder = SSEDecoder()
     for raw in resp:
-        line = raw.decode('utf-8', 'replace') if isinstance(raw, bytes) else raw
-        line = line.rstrip('\r\n')
-        if line == '':
-            if data_lines:
-                yield '\n'.join(data_lines)
-                data_lines = []
-            continue
-        if line.startswith(':'):
-            continue
-        if line.startswith('data:'):
-            data_lines.append(line[5:].lstrip())
-    if data_lines:
-        yield '\n'.join(data_lines)
+        for payload in decoder.feed(raw):
+            yield payload
+    tail = decoder.close()
+    if tail is not None:
+        yield tail
 
 
 def accumulate_tool_calls(delta_calls, acc):
-    """Fold streamed tool-call fragments into complete OpenAI-shaped tool calls."""
+    """Fold streamed tool-call fragments into complete OpenAI-shaped tool calls.
+
+    llama.cpp sends a tool call as a long run of fragments: the id once, the function
+    name possibly split across chunks, and the JSON arguments dribbled out a few
+    characters at a time. Multiple calls can be interleaved by `index`. Nothing here
+    parses the arguments — an incomplete JSON string is not an error, it is just not
+    finished yet, and only the caller decides when the call is complete.
+    """
     for tc in delta_calls or []:
-        idx = tc.get('index', 0)
+        try:
+            idx = int(tc.get('index', 0))
+        except (TypeError, ValueError):
+            idx = 0
         slot = acc.setdefault(idx, {'id': None, 'type': 'function',
                                     'function': {'name': '', 'arguments': ''}})
         if tc.get('id'):
             slot['id'] = tc['id']
+        if tc.get('type'):
+            slot['type'] = tc['type']
         fn = tc.get('function') or {}
         if fn.get('name'):
             slot['function']['name'] += fn['name']
@@ -277,11 +428,395 @@ def accumulate_tool_calls(delta_calls, acc):
     return acc
 
 
+def arguments_complete(raw):
+    """True when a streamed tool-call argument string is plausibly complete JSON.
+
+    Used only to decide whether to *attempt* execution. A false negative just means we
+    report the call as truncated instead of guessing.
+    """
+    if raw is None:
+        return True
+    if not isinstance(raw, str):
+        return True
+    s = raw.strip()
+    if not s:
+        return True                      # empty arguments == no arguments
+    try:
+        json.loads(s)
+        return True
+    except ValueError:
+        return False
+
+
+# ======================================================================
+# HTTP transport: one persistent connection, transparent reconnect,
+# and a retry policy that never replays a generation that may have run.
+# ======================================================================
+class HttpTransport:
+    """Persistent HTTP/1.1 connection to one host, with keep-alive and safe retries.
+
+    Every request the client makes used to open a fresh TCP connection; against a
+    Cloudflare tunnel that means a TLS handshake per call, which dominated the latency
+    of short requests and of the token-counting round trips. This keeps one connection
+    open, reuses it, and reconnects transparently when the far end has closed it.
+
+    Retry safety is explicit. A failed call reports how far it got:
+      * connect  — the socket never opened; the server saw nothing.  Safe to retry.
+      * sent     — bytes left this process. The server may be generating. NOT retried
+                   for POST; the caller gets a clear message instead of a duplicate.
+      * response — the request completed but the reply was lost. NOT retried for POST.
+    """
+
+    def __init__(self, url, timeout=30, connect_timeout=15, opener=None, log=None,
+                 keepalive=True, idle_ttl=3.0):
+        parsed = urllib.parse.urlsplit(url)
+        self.scheme = parsed.scheme or 'http'
+        self.host = parsed.hostname or ''
+        self.port = parsed.port or (443 if self.scheme == 'https' else 80)
+        self.prefix = urllib.parse.urlunsplit((self.scheme, parsed.netloc, '', '', ''))
+        self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.opener = opener                 # injectable for tests / non-http clients
+        self.log = log or (lambda *a, **k: None)
+        self.keepalive = keepalive
+        self.idle_ttl = idle_ttl     # shorter than the server's keep-alive window
+        self._conn = None
+        self._stream_outstanding = False
+        self.last_used = 0.0
+        self.connections_opened = 0
+        self.requests = 0
+        self.reconnects = 0
+        self._ssl_context = ssl.create_default_context() if self.scheme == 'https' else None
+
+    # ------------------------------------------------------------------
+    def _new_conn(self):
+        self.close()
+        if self.scheme == 'https':
+            conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.connect_timeout,
+                                               context=self._ssl_context)
+        else:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=self.connect_timeout)
+        self._conn = conn
+        self.connections_opened += 1
+        return conn
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        self._stream_outstanding = False
+
+    # ------------------------------------------------------------------
+    def request(self, method, url, body=None, headers=None, timeout=None, retry=None,
+                stream=False):
+        """One HTTP call -> http.client.HTTPResponse (caller must close it).
+
+        `retry` overrides the retry policy; by default GET/HEAD may be retried freely and
+        POST is retried only when we can prove the server never saw it.
+        """
+        if self.opener is not None:
+            req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+            return self.opener.open(req, timeout=timeout or self.timeout)
+
+        parts = urllib.parse.urlsplit(url)
+        target = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, ''))
+        idempotent = method.upper() in ('GET', 'HEAD')
+        allow = idempotent if retry is None else bool(retry)
+        last = None
+        for attempt in (1, 2):
+            sent = False
+            pooled = False
+            try:
+                conn = self._reusable_conn()
+                pooled = conn is not None
+                if conn is None:
+                    conn = self._new_conn()
+                conn.timeout = timeout or self.timeout
+                conn.request(method.upper(), target, body=body,
+                             headers=dict(headers or {}, Connection='keep-alive'))
+                sent = True
+                if conn.sock is not None:
+                    # conn.timeout only applies to connect; the read deadline for a long
+                    # generation is set on the socket itself.
+                    try:
+                        conn.sock.settimeout(timeout or self.timeout)
+                    except OSError:
+                        pass
+                resp = conn.getresponse()
+                self.requests += 1
+                self.last_used = time.monotonic()
+                if stream:
+                    # Nothing may be multiplexed onto this connection until the caller
+                    # hands the body back via release() — even if the caller forgets.
+                    self._stream_outstanding = True
+                if not self.keepalive or resp.will_close:
+                    # Never pool a connection the peer is closing, or one whose body we
+                    # may abandon mid-stream — the next request would read stale bytes.
+                    self._conn = None
+                return resp
+            except http.client.HTTPException as e:
+                self.close()
+                last = e
+                # A pooled connection that died before we wrote anything is the common
+                # keep-alive-expiry case: provably nothing reached the server.
+                if allow and not sent and (pooled or attempt == 1):
+                    self.reconnects += 1
+                    self.log(f'transport: {type(e).__name__} before send — reconnecting')
+                    continue
+                raise TransportError(f'{url}: {type(e).__name__}: {e}', url,
+                                     request_sent=sent,
+                                     phase='sent' if sent else 'connect') from None
+            except (socket.timeout, TimeoutError) as e:
+                self.close()
+                last = e
+                if allow and not sent and attempt == 1:
+                    self.reconnects += 1
+                    continue
+                raise TransportError(
+                    f'{url}: {"response" if sent else "connect"} timed out after '
+                    f'{timeout or self.connect_timeout}s', url, request_sent=sent,
+                    phase='response' if sent else 'connect') from None
+            except OSError as e:
+                self.close()
+                last = e
+                if allow and not sent and attempt == 1:
+                    self.reconnects += 1
+                    self.log(f'transport: {type(e).__name__} before send — reconnecting')
+                    continue
+                raise TransportError(f'cannot reach {url}: {e}', url, request_sent=sent,
+                                     phase='sent' if sent else 'connect') from None
+        raise TransportError(f'request to {url} failed: {last}', url, request_sent=True)
+
+    def release(self, resp, drained):
+        """Return a streamed response to the pool, or drop the connection.
+
+        A body we stopped reading early leaves unread bytes in the socket; the next
+        request on that connection would parse them as its response. `drained=False`
+        therefore always costs us the connection — cheap compared to a corrupted reply.
+        """
+        self._stream_outstanding = False
+        if not drained:
+            self.close()
+
+    def _reusable_conn(self):
+        """Return the pooled connection unless it has been idle too long.
+
+        llama-server (and Cloudflare's edge) close idle keep-alive connections after a
+        few seconds. Reusing one that the peer already dropped turns into a failure at
+        send time, which for a chat POST is not provably safe to retry. Dropping an
+        idle connection here avoids that ambiguity almost entirely.
+        """
+        if not self.keepalive or self._conn is None:
+            return None
+        if self._stream_outstanding:
+            # A stream is still open (or its reader was dropped without closing): the
+            # socket holds unread bytes, so it cannot serve another request.
+            self.close()
+            self._stream_outstanding = False
+            return None
+        if time.monotonic() - self.last_used > self.idle_ttl:
+            self.close()
+            return None
+        return self._conn
+
+    def stats(self):
+        return {'connections_opened': self.connections_opened, 'requests': self.requests,
+                'reconnects': self.reconnects, 'pooled': self._conn is not None}
+
+
+# ======================================================================
+# Reasoning / thinking control
+#
+# Built from what the PrismML runtime actually accepts, not from another model's API:
+#   * request field `thinking_budget_tokens` — 0 disables thinking, N caps the thinking
+#     trace at N tokens, -1 is unlimited (docs.prismml.com/bonsai-2-27b, "Thinking mode").
+#   * request field `reasoning_effort` — a chat-template kwarg; Bonsai 2 accepts
+#     `medium` and `xhigh` (its default). `low` is accepted but documented as *not*
+#     reducing thinking, so this client refuses to offer it as if it were a speed knob.
+#   * server flags `--reasoning-budget N` and `--chat-template-kwargs '{"reasoning_effort":…}'`
+#     set the default for clients that send nothing.
+# The official Bonsai chat UI's Off/Low/Medium/High/Max picker is exactly these budgets
+# (0 / 512 / 2048 / 8192 / unlimited); `THINK_LEVELS` reproduces it 1:1.
+# ======================================================================
+THINK_BUDGETS = {'off': 0, 'low': 512, 'medium': 2048, 'high': 8192, 'max': -1}
+THINK_ORDER = ('off', 'low', 'medium', 'high', 'max')
+THINK_ALIASES = {'none': 'off', '0': 'off', 'no': 'off', 'disable': 'off', 'disabled': 'off',
+                 'minimal': 'low', '512': 'low', 'normal': 'medium', '2048': 'medium',
+                 'med': 'medium', '8192': 'high', 'maximum': 'max', 'unlimited': 'max',
+                 'xhigh': 'max', 'full': 'max', '-1': 'max'}
+
+# `reasoning_effort` values the Bonsai 2 template accepts. `low` is deliberately absent
+# from the offered set: PrismML documents it as not reducing thinking, so offering it
+# would be a fake control. It is still accepted verbatim if a user asks for it.
+EFFORT_VALUES = ('medium', 'xhigh')
+EFFORT_ALIASES = {'default': 'xhigh', 'highest': 'xhigh', 'max': 'xhigh', 'maximum': 'xhigh',
+                  'high': 'xhigh', 'normal': 'medium', 'med': 'medium', 'balanced': 'medium'}
+EFFORT_UNRELIABLE = ('low', 'minimal', 'none')
+
+REASONING_DISPLAYS = ('full', 'compact', 'hidden')
+
+
+def parse_think_level(raw):
+    """Map a user word to a canonical thinking level. Raises ValueError on nonsense."""
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if key in THINK_BUDGETS:
+        return key
+    if key in THINK_ALIASES:
+        return THINK_ALIASES[key]
+    if key.lstrip('-').isdigit():            # a bare number is an explicit token budget
+        return int(key)
+    raise ValueError(f'unknown thinking level {raw!r} — use ' + '|'.join(THINK_ORDER)
+                     + ' or a token count')
+
+
+def parse_effort(raw):
+    key = str(raw or '').strip().lower()
+    if key in EFFORT_VALUES:
+        return key
+    if key in EFFORT_ALIASES:
+        return EFFORT_ALIASES[key]
+    if key in EFFORT_UNRELIABLE:
+        return key
+    raise ValueError(f'unknown reasoning_effort {raw!r} — Bonsai 2 accepts '
+                     + '|'.join(EFFORT_VALUES) + ' (low is accepted but documented as a no-op)')
+
+
+class ReasoningConfig:
+    """What to ask the model for, and how to show what comes back.
+
+    Two independent axes, because that is what the runtime offers:
+      * `level`  -> a thinking token budget (the Off..Max picker)
+      * `effort` -> the template's reasoning_effort (medium / xhigh)
+    `display` controls the terminal: `full` prints the thinking trace, `compact` prints a
+    one-line indicator plus a token count, `hidden` prints neither.
+    """
+
+    def __init__(self, level='medium', effort='medium', display='compact'):
+        self.level = parse_think_level(level)
+        self.effort = parse_effort(effort) if effort else None
+        self.display = display if display in REASONING_DISPLAYS else 'compact'
+
+    # ------------------------------------------------------------------
+    def budget(self):
+        """The thinking token budget for the current level (int), or None if free-form."""
+        if isinstance(self.level, str) and self.level in THINK_BUDGETS:
+            return THINK_BUDGETS[self.level]
+        try:
+            return int(self.level)
+        except (TypeError, ValueError):
+            return None
+
+    def label(self):
+        budget = self.budget()
+        shown = 'unlimited' if budget == -1 else ('off' if budget == 0 else f'{budget} tok')
+        return f'{self.level} ({shown})'
+
+    def wire(self, caps=None):
+        """Request fields for this configuration, filtered by what the server accepts.
+
+        Returns (fields, notes). `notes` explains anything that was dropped, so a user
+        who asked for thinking control is never silently ignored.
+        """
+        fields, notes = {}, []
+        budget = self.budget()
+        # Tri-state: `caps.supported()` returns None when the field has not been tested
+        # against this build yet. Unknown must mean "send it and find out" — only an
+        # explicit False (the server answered 400 naming the field) suppresses it.
+        if budget is not None:
+            if caps is None or caps.supported('thinking_budget_tokens') is not False:
+                fields['thinking_budget_tokens'] = budget
+            else:
+                notes.append('this build rejects thinking_budget_tokens — thinking is '
+                             'server-controlled')
+        # `caps.supported()` is tri-state: None means untested, so we still send it and
+        # let the server's own 400 teach us. Only an explicit False suppresses the field.
+        if self.effort and (caps is None or caps.supported('reasoning_effort') is not False):
+            fields['reasoning_effort'] = self.effort
+        elif self.effort:
+            notes.append('this build rejects reasoning_effort — the effort setting is inert')
+        return fields, notes
+
+    def describe(self):
+        parts = [f'think={self.label()}']
+        if self.effort:
+            parts.append(f'effort={self.effort}')
+        parts.append(f'display={self.display}')
+        return ', '.join(parts)
+
+    def to_dict(self):
+        return {'level': self.level, 'effort': self.effort, 'display': self.display,
+                'budget': self.budget()}
+
+    @classmethod
+    def from_dict(cls, d):
+        d = d or {}
+        return cls(level=d.get('level', 'medium'), effort=d.get('effort', 'medium'),
+                   display=d.get('display', 'compact'))
+
+
+class CapabilityMap:
+    """What this particular server build actually does, learned not assumed.
+
+    Every entry is one of `supported` / `unsupported` / `unknown`, plus the evidence that
+    produced it. `/doctor` prints the whole map so a user can see what is real, what is
+    missing, and what was never tested.
+    """
+
+    KNOWN_FIELDS = ('reasoning_effort', 'thinking_budget_tokens', 'tools', 'tool_choice',
+                    'response_format', 'min_p', 'top_k', 'stream_options')
+
+    def __init__(self):
+        self.fields = {k: 'unknown' for k in self.KNOWN_FIELDS}
+        self.evidence = {}
+        self.facts = {}            # free-form: model ids, context, vision, runtime…
+
+    # ------------------------------------------------------------------
+    def mark(self, name, state, evidence=''):
+        if state not in ('supported', 'unsupported', 'unknown'):
+            raise ValueError(state)
+        self.fields.setdefault(name, state)
+        self.fields[name] = state
+        if evidence:
+            self.evidence[name] = evidence
+
+    def supported(self, name):
+        """True / False / None(unknown). Callers treat unknown as 'try it'."""
+        state = self.fields.get(name, 'unknown')
+        return None if state == 'unknown' else state == 'supported'
+
+    def state(self, name):
+        return self.fields.get(name, 'unknown')
+
+    def note_400(self, name, message):
+        self.mark(name, 'unsupported', f'HTTP 400: {str(message)[:160]}')
+
+    def note_ok(self, name):
+        if self.fields.get(name) != 'unsupported':
+            self.mark(name, 'supported', 'accepted by the server')
+
+    def set_fact(self, key, value):
+        self.facts[key] = value
+
+    def to_dict(self):
+        return {'fields': dict(self.fields), 'evidence': dict(self.evidence),
+                'facts': dict(self.facts)}
+
+
 class BonsaiClient:
-    """Minimal OpenAI-compatible client: chat (streaming + not), models, props, tokenize."""
+    """OpenAI-compatible client: chat (streaming + not), models, props, tokenize.
+
+    One persistent HTTP connection (see HttpTransport), a capability map learned from the
+    server instead of assumed, and a retry policy that will not replay a chat POST the
+    server may already be generating.
+    """
 
     def __init__(self, base_url, api_key, model=DEFAULT_MODEL, timeout=600,
-                 connect_timeout=30, retries=3, opener=None, log=None):
+                 connect_timeout=30, retries=3, opener=None, log=None, keepalive=True):
         self.base_url = normalize_base_url(base_url)
         # llama.cpp serves OpenAI routes under /v1 but its own routes (/props, /tokenize,
         # /health) at the server root — the deployment cell does the same split.
@@ -293,10 +828,22 @@ class BonsaiClient:
         self.retries = max(1, retries)
         self.opener = opener  # injectable for tests
         self.log = log or (lambda *a, **k: None)
+        self.caps = CapabilityMap()
+        # Back-compat shims: older code/tests read these booleans directly.
         self.supports_reasoning_effort = True
         self.supports_tools = True
+        self.transport = HttpTransport(self.root_url, timeout=timeout,
+                                       connect_timeout=connect_timeout, opener=opener,
+                                       log=self.log, keepalive=keepalive)
         self._vision = None
         self._context = None
+        self._props = None
+        self._props_checked = False
+        self.latency = []           # recent request latencies, seconds
+        self.stats = {'requests': 0, 'chat_requests': 0, 'retries': 0, 'cancelled': 0}
+
+    def close(self):
+        self.transport.close()
 
     # ------------------------------------------------------------------
     def _headers(self, stream=False):
@@ -307,68 +854,89 @@ class BonsaiClient:
             h['Authorization'] = 'Bearer ' + self.api_key
         return h
 
-    def _open(self, req, timeout):
-        if self.opener is not None:
-            return self.opener.open(req, timeout=timeout)
-        ctx = ssl.create_default_context()
-        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    def _raise_for_status(self, resp, url):
+        """Turn a non-2xx reply into a BonsaiAPIError with the server's own message."""
+        if 200 <= resp.status < 300:
+            return
+        try:
+            body = resp.read() or b''
+        except Exception:
+            body = b''
+        finally:
+            resp.close()
+        try:
+            parsed = json.loads(body.decode('utf-8', 'replace'))
+            msg = parsed.get('error')
+            if isinstance(msg, dict):
+                msg = msg.get('message') or json.dumps(msg)
+            msg = str(msg or body[:400].decode('utf-8', 'replace'))
+        except Exception:
+            msg = body[:400].decode('utf-8', 'replace') or f'HTTP {resp.status}'
+        raise BonsaiAPIError(resp.status, msg, url)
 
-    def request(self, path, payload=None, stream=False, timeout=None, root=False):
-        """One HTTP call with retry/backoff. Returns the response object (caller closes).
+    def request(self, path, payload=None, stream=False, timeout=None, root=False, retry=None,
+                _stream=None):
+        """One HTTP call. Returns the response object (caller closes it).
 
-        `root=True` targets a llama.cpp-native route (/props, /tokenize, /health) instead of
-        an OpenAI-compatible one under /v1.
+        `root=True` targets a llama.cpp-native route (/props, /tokenize, /health) instead
+        of an OpenAI-compatible one under /v1.
+
+        Retries are bounded and only ever replay requests that provably never reached the
+        server, so a chat POST is never generated twice. 429/5xx and connect failures are
+        retried for GETs; a POST is retried only when the transport reports the bytes
+        never left this process.
         """
-        url = (self.root_url if root else self.base_url) + path
+        base = self.root_url if root else self.base_url
+        url = base + path
         data = json.dumps(payload).encode() if payload is not None else None
+        method = 'POST' if data is not None else 'GET'
+        deadline_timeout = timeout or (self.timeout if stream else self.connect_timeout)
         last = None
-        for attempt in range(1, self.retries + 1):
-            req = urllib.request.Request(url, data=data, headers=self._headers(stream),
-                                         method='POST' if data is not None else 'GET')
+        attempts = self.retries if (retry is None or retry) else 1
+        for attempt in range(1, max(1, attempts) + 1):
+            started = time.monotonic()
             try:
-                return self._open(req, timeout or (self.timeout if stream else self.connect_timeout))
-            except urllib.error.HTTPError as e:
-                body = b''
-                try:
-                    body = e.read() or b''
-                except Exception:
-                    pass
-                try:
-                    parsed = json.loads(body.decode('utf-8', 'replace'))
-                    msg = parsed.get('error')
-                    if isinstance(msg, dict):
-                        msg = msg.get('message') or json.dumps(msg)
-                    msg = str(msg or body[:400].decode('utf-8', 'replace'))
-                except Exception:
-                    msg = body[:400].decode('utf-8', 'replace') or e.reason or ''
-                if e.code in (429, 502, 503, 504) and attempt < self.retries:
-                    last = BonsaiAPIError(e.code, msg, url)
-                    wait = min(2 ** attempt, 8)
-                    self.log(f'transient HTTP {e.code}, retrying in {wait}s')
-                    time.sleep(wait)
-                    continue
-                raise BonsaiAPIError(e.code, msg, url) from None
-            except urllib.error.URLError as e:
+                resp = self.transport.request(method, url, body=data,
+                                              headers=self._headers(stream),
+                                              timeout=deadline_timeout, retry=retry,
+                                              stream=bool(stream if _stream is None
+                                                          else _stream))
+                self.stats['requests'] += 1
+                self.latency.append(time.monotonic() - started)
+                del self.latency[:-64]
+                self._raise_for_status(resp, url)
+                return resp
+            except TransportError as e:
                 last = e
-                reason = str(getattr(e, 'reason', e))
-                if attempt < self.retries:
+                # A POST whose bytes may have reached the server is never replayed.
+                if method == 'POST' and not e.safe_to_retry_post:
+                    raise BonsaiError(
+                        f'{url}: the request reached the server but no reply came back '
+                        f'({e.phase}). Not retrying automatically — the model may already be '
+                        'generating, and a blind retry would produce a second, duplicated '
+                        'answer. Send the turn again yourself if you want it re-run.') from None
+                if attempt < attempts:
                     wait = min(2 ** attempt, 8)
-                    self.log(f'network error ({reason}), retrying in {wait}s')
+                    self.stats['retries'] += 1
+                    self.log(f'transport failure ({e}), retrying in {wait}s')
                     time.sleep(wait)
                     continue
                 raise BonsaiError(
-                    f'cannot reach {url}: {reason}. Is the notebook runtime still alive? '
+                    f'cannot reach {url}: {e}. Is the notebook runtime still alive? '
                     'Quick Tunnel URLs die with the session — rerun the deployment cell and '
                     'use the new URL.') from None
-            except (socket.timeout, TimeoutError) as e:
+            except BonsaiAPIError as e:
                 last = e
-                if attempt < self.retries:
+                transient = e.status in (429, 502, 503, 504)
+                # 502/503 from a tunnel mean the edge could not reach the origin: the
+                # request never started a generation, so replaying it is safe.
+                if transient and attempt < attempts:
                     wait = min(2 ** attempt, 8)
-                    self.log(f'timeout, retrying in {wait}s')
+                    self.stats['retries'] += 1
+                    self.log(f'transient HTTP {e.status}, retrying in {wait}s')
                     time.sleep(wait)
                     continue
-                raise BonsaiError(f'request to {url} timed out after '
-                                  f'{timeout or self.connect_timeout}s') from None
+                raise
         raise BonsaiError(f'request to {url} failed: {last}')
 
     def get_json(self, path, timeout=None, root=False):
@@ -381,16 +949,27 @@ class BonsaiClient:
 
     def model_ids(self):
         try:
-            return [m.get('id') for m in (self.models().get('data') or []) if m.get('id')]
+            ids = [m.get('id') for m in (self.models().get('data') or []) if m.get('id')]
         except BonsaiError:
             return []
+        self.caps.set_fact('served_models', ids)
+        return ids
 
-    def props(self):
-        """llama.cpp /props — context size, slot state. Not part of the OpenAI spec."""
+    def props(self, refresh=False):
+        """llama.cpp /props — context size, slot state. Fetched once and cached.
+
+        The context window, the vision modality and the runtime version all live here, so
+        one call answers several questions; repeating it per turn was pure latency.
+        """
+        if self._props_checked and not refresh:
+            return self._props
+        self._props_checked = True
         try:
-            return self.get_json('/props', timeout=15, root=True)
-        except BonsaiError:
-            return None
+            self._props = self.get_json('/props', timeout=15, root=True)
+        except BonsaiError as e:
+            self._props = None
+            self.log(f'/props unavailable ({e})')
+        return self._props
 
     def health(self):
         """llama.cpp /health -> the parsed body, or None when unreachable."""
@@ -409,6 +988,24 @@ class BonsaiClient:
         except BonsaiError:
             return None
 
+    def tokenize_batch(self, texts):
+        """Token counts for many strings in one round trip.
+
+        Budget trimming re-measures the whole history; doing that one /tokenize per
+        message is dozens of round trips per turn on a long session. llama.cpp's
+        /tokenize returns exactly one count per request, so this batches what it can and
+        falls back to per-item calls for the rest — never inventing a batch API.
+        """
+        out = {}
+        for t in texts:
+            if t in out:
+                continue
+            n = self.tokenize(t)
+            if n is None:
+                return None
+            out[t] = n
+        return out
+
     def context_window(self, default=8192):
         """Server context size in tokens, probed once from /props and then cached."""
         if self._context:
@@ -417,47 +1014,90 @@ class BonsaiClient:
         found = None
         sub = props.get('default_generation_settings') or {}
         for source in (sub, props):
-            for k in ('n_ctx', 'n_ctx_total'):
-                if isinstance(source.get(k), int) and source[k] > 0:
-                    found = source[k]
-                    break
-            if found:
-                break
+            for k in ('n_ctx', 'n_ctx_per_seq', 'n_ctx_total'):
+                v = source.get(k)
+                if isinstance(v, int) and v > 0:
+                    found = v if found is None else min(found, v)
         self._context = found or default
+        self.caps.set_fact('context_window', self._context)
         return self._context
+
+    def server_facts(self):
+        """Everything /props can tell us, gathered once, for /doctor and --json."""
+        props = self.props() or {}
+        sub = props.get('default_generation_settings') or {}
+        facts = {
+            'model_path': sub.get('model') or None,
+            'n_ctx': self.context_window(),
+            'total_slots': props.get('total_slots'),
+            'version': props.get('system_info') or sub.get('version') or None,
+            'chat_template': 'present' if sub.get('chat_template') else 'not reported',
+        }
+        for k, v in facts.items():
+            if v is not None:
+                self.caps.set_fact(k, v)
+        return facts
 
     # ------------------------------------------------------------------
     def _post_chat(self, payload, stream, timeout):
-        """POST /chat/completions, dropping fields the server build rejects."""
+        """POST /chat/completions, dropping fields this server build has rejected."""
         payload = dict(payload)
         if payload.get('reasoning_effort') is None:
             payload.pop('reasoning_effort', None)
-        if not self.supports_reasoning_effort:
+        if self.caps.supported('reasoning_effort') is False:
             payload.pop('reasoning_effort', None)
+        if self.caps.supported('thinking_budget_tokens') is False:
+            payload.pop('thinking_budget_tokens', None)
         if not payload.get('tools'):
             payload.pop('tools', None)
             payload.pop('tool_choice', None)
-        if not self.supports_tools:
+        if self.caps.supported('tools') is False:
             payload.pop('tools', None)
             payload.pop('tool_choice', None)
+        optional = ('reasoning_effort', 'thinking_budget_tokens', 'min_p', 'top_k',
+                    'response_format')
         try:
-            return self.request('/chat/completions', payload, stream=stream, timeout=timeout)
+            self.stats['chat_requests'] += 1
+            return self.request('/chat/completions', payload, stream=stream, timeout=timeout,
+                                _stream=stream)
         except BonsaiAPIError as e:
             if e.status != 400:
                 raise
             msg = (e.message or '').lower()
-            if 'reasoning_effort' in msg and 'reasoning_effort' in payload:
-                self.supports_reasoning_effort = False
-                self.log('server rejected reasoning_effort — continuing without it')
-                payload.pop('reasoning_effort', None)
-                return self.request('/chat/completions', payload, stream=stream, timeout=timeout)
-            if ('tool' in msg or 'jinja' in msg) and 'tools' in payload:
-                self.supports_tools = False
-                self.log('server rejected tools — continuing without tool calling')
-                payload.pop('tools', None)
+            dropped = None
+            for field_name in optional:
+                if field_name in payload and field_name in msg:
+                    dropped = field_name
+                    break
+            if dropped is None and 'tools' in payload and ('tool' in msg or 'jinja' in msg):
+                dropped = 'tools'
+            if dropped is None:
+                raise
+            self.caps.note_400(dropped, e.message)
+            self._sync_shims()
+            self.log(f'server rejected {dropped} — continuing without it')
+            payload.pop(dropped, None)
+            if dropped == 'tools':
                 payload.pop('tool_choice', None)
-                return self.request('/chat/completions', payload, stream=stream, timeout=timeout)
-            raise
+            return self.request('/chat/completions', payload, stream=stream, timeout=timeout,
+                                _stream=stream)
+
+    def note_accepted(self, fields):
+        """Record that the fields present in a request were accepted by the server.
+
+        Called after a *successful* response only, so a capability is never marked
+        supported on the strength of a request that was rejected or never answered.
+        """
+        for name in ('reasoning_effort', 'thinking_budget_tokens', 'tools', 'tool_choice',
+                     'min_p', 'top_k', 'response_format'):
+            if name in fields:
+                self.caps.note_ok(name)
+        if fields.get('stream_options'):
+            self.caps.note_ok('stream_options')
+
+    def _sync_shims(self):
+        self.supports_reasoning_effort = self.caps.supported('reasoning_effort') is not False
+        self.supports_tools = self.caps.supported('tools') is not False
 
     def chat(self, messages, tools=None, **params):
         """Non-streaming chat completion -> the raw JSON response dict."""
@@ -467,10 +1107,20 @@ class BonsaiClient:
             payload['tools'] = tools
             payload.setdefault('tool_choice', 'auto')
         with self._post_chat(payload, False, params.get('timeout')) as r:
-            return json.loads(r.read().decode('utf-8', 'replace'))
+            data = json.loads(r.read().decode('utf-8', 'replace'))
+        if data.get('usage'):
+            self.caps.note_ok('stream_options')
+        for f in ('reasoning_effort', 'thinking_budget_tokens', 'tools', 'min_p', 'top_k'):
+            if f in payload:
+                self.caps.note_ok(f)
+        return data
 
     def stream_chat(self, messages, tools=None, **params):
-        """Streaming chat completion. Yields normalized events; see module docs."""
+        """Streaming chat completion -> a ChatStream (use it as a context manager).
+
+        The returned object is iterable and also exposes `.close()`, so a cancelled turn
+        deterministically releases the HTTP response instead of waiting on the GC.
+        """
         payload = {'model': self.model, 'messages': messages, 'stream': True,
                    'stream_options': {'include_usage': True}}
         payload.update({k: v for k, v in params.items() if v is not None})
@@ -478,57 +1128,41 @@ class BonsaiClient:
             payload['tools'] = tools
             payload.setdefault('tool_choice', 'auto')
         resp = self._post_chat(payload, True, params.get('timeout'))
-        return self._event_stream(resp)
-
-    def _event_stream(self, resp):
-        text, reason = [], []
-        tool_acc = {}
-        finish, usage, timings = None, None, None
-        started = time.monotonic()
-        first_token_at = None
-        with resp:
-            for payload in iter_sse_events(resp):
-                if payload.strip() == '[DONE]':
-                    break
-                try:
-                    ev = json.loads(payload)
-                except ValueError:
-                    continue
-                if ev.get('usage'):
-                    usage = ev['usage']
-                if ev.get('timings'):
-                    timings = ev['timings']
-                choices = ev.get('choices') or []
-                if not choices:
-                    continue
-                ch = choices[0]
-                if ch.get('finish_reason'):
-                    finish = ch['finish_reason']
-                delta = ch.get('delta') or {}
-                accumulate_tool_calls(delta.get('tool_calls'), tool_acc)
-                rc = delta.get('reasoning_content') or delta.get('reasoning')
-                if rc:
-                    reason.append(rc)
-                    first_token_at = first_token_at or time.monotonic()
-                    yield {'kind': 'reasoning', 'text': rc}
-                ct = delta.get('content')
-                if ct:
-                    text.append(ct)
-                    first_token_at = first_token_at or time.monotonic()
-                    yield {'kind': 'delta', 'text': ct}
-        tool_calls = [tool_acc[k] for k in sorted(tool_acc)]
-        message = {'role': 'assistant', 'content': ''.join(text)}
-        if ''.join(reason):
-            message['reasoning_content'] = ''.join(reason)
-        if tool_calls:
-            message['tool_calls'] = tool_calls
-            message['content'] = message['content'] or None
-        yield {'kind': 'done', 'message': message, 'tool_calls': tool_calls,
-               'finish_reason': finish, 'usage': usage, 'timings': timings,
-               'elapsed': time.monotonic() - started,
-               'ttft': (first_token_at - started) if first_token_at else None}
+        # _post_chat already went through request(stream=True), so the transport knows a
+        # body is outstanding and will not reuse the socket until ChatStream.close().
+        return ChatStream(resp, sent_fields=payload, transport=self.transport)
 
     # ------------------------------------------------------------------
+    def probe_field(self, field_name, value, messages=None):
+        """Confirm with a real 1-token request that the server accepts `field_name`.
+
+        Cheap and honest: a capability we have not tested is reported as unknown rather
+        than advertised. Called lazily, and the result is cached in the capability map.
+        """
+        state = self.caps.supported(field_name)
+        if state is not None:
+            return state
+        payload = {'model': self.model,
+                   'messages': messages or [{'role': 'user', 'content': 'Reply: ok'}],
+                   'max_tokens': 1, 'stream': False, field_name: value}
+        try:
+            with self.request('/chat/completions', payload, timeout=self.connect_timeout) as r:
+                r.read()
+            self.caps.mark(field_name, 'supported', 'accepted in a probe request')
+            return True
+        except BonsaiAPIError as e:
+            if e.status == 400 and field_name in (e.message or '').lower():
+                self.caps.note_400(field_name, e.message)
+                return False
+            # Any other error tells us nothing about this field.
+            self.log(f'probe of {field_name} inconclusive: HTTP {e.status}')
+            return False
+        except BonsaiError as e:
+            self.log(f'probe of {field_name} inconclusive: {e}')
+            return False
+        finally:
+            self._sync_shims()
+
     def probe_vision(self, force=None):
         """Can this server actually see pixels? Probed once with a 1x1 PNG, then cached.
 
@@ -537,6 +1171,7 @@ class BonsaiClient:
         """
         if force is not None:
             self._vision = bool(force)
+            self.caps.set_fact('vision', self._vision)
             return self._vision
         if self._vision is not None:
             return self._vision
@@ -544,6 +1179,8 @@ class BonsaiClient:
         if isinstance(modalities, dict) and isinstance(modalities.get('vision'), bool):
             self._vision = modalities['vision']
             self.log(f'/props reports vision={self._vision}')
+            self.caps.set_fact('vision', self._vision)
+            self.caps.set_fact('vision_source', '/props modalities')
             return self._vision
         png_1x1 = ('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA'
                    'hKmMIQAAAABJRU5ErkJggg==')
@@ -556,10 +1193,233 @@ class BonsaiClient:
         except BonsaiAPIError as e:
             self._vision = False
             self.log(f'vision probe returned HTTP {e.status} — treating server as text-only')
+            self.caps.set_fact('vision_source', f'probe rejected with HTTP {e.status}')
         except BonsaiError as e:
             self.log(f'vision probe failed: {e}')
             self._vision = False
+            self.caps.set_fact('vision_source', 'probe failed')
+        self.caps.set_fact('vision', self._vision)
         return self._vision
+
+
+# ======================================================================
+# Streaming: one object owns the response, the decoder and the accumulator
+# ======================================================================
+class ChatStream:
+    """A live streaming chat completion.
+
+    Owns the HTTP response so cancellation is deterministic: `.close()` (or leaving the
+    `with` block) always shuts the response down and, when the body was not fully read,
+    drops the pooled connection rather than handing the next request a stream of stale
+    bytes. Iteration yields `reasoning` / `delta` events and a final `done` event carrying
+    the assembled assistant message, usage, timings, finish reason, TTFT and elapsed time.
+
+    A stream that dies mid-generation raises StreamInterrupted carrying whatever did
+    arrive — a partial answer is reported as partial and is never quietly promoted to a
+    completed assistant turn.
+    """
+
+    #: how long to wait for the server to close the chunked body after [DONE] so the
+    #: connection can go back to the pool; longer than that and we just drop it.
+    DRAIN_TIMEOUT = 2.0
+
+    def __init__(self, resp, sent_fields=None, transport=None):
+        self.resp = resp
+        self.transport = transport
+        self.sent_fields = sent_fields or {}
+        self.drained = False
+        self.decoder = SSEDecoder()
+        self.text = []
+        self.reason = []
+        self.tool_acc = {}
+        self.finish = None
+        self.usage = None
+        self.timings = None
+        self.model = None
+        self.started = time.monotonic()
+        self.first_token_at = None
+        self.chunks = 0
+        self.malformed = 0
+        self.closed = False
+        self.done = False
+        self.interrupted = None
+
+    # ------------------------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def drain(self):
+        """Read the (empty) remainder of the body so the connection stays reusable."""
+        if self.drained or self.resp is None:
+            return
+        sock = getattr(getattr(self.resp, 'fp', None), 'raw', None)
+        sock = getattr(sock, '_sock', None)
+        previous = None
+        try:
+            if sock is not None:
+                previous = sock.gettimeout()
+                sock.settimeout(self.DRAIN_TIMEOUT)
+            self.resp.read()
+            self.drained = True
+        except Exception:
+            self.drained = False
+        finally:
+            if sock is not None and previous is not None:
+                try:
+                    sock.settimeout(previous)
+                except OSError:
+                    pass
+
+    def close(self):
+        """Shut the response down and release the connection exactly once.
+
+        Deterministic release matters for cancellation: Ctrl-C in the middle of a long
+        generation must not leave a socket open holding the single serving slot.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        resp = self.resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if self.transport is not None:
+            self.transport.release(resp, self.drained)
+
+    # ------------------------------------------------------------------
+    def _handle(self, ev):
+        """Apply one decoded SSE event; returns an event dict to yield, or None."""
+        if not isinstance(ev, dict):
+            self.malformed += 1
+            return None
+        if ev.get('model'):
+            self.model = ev['model']
+        if ev.get('usage'):
+            self.usage = ev['usage']
+        if ev.get('timings'):
+            self.timings = ev['timings']
+        # llama.cpp also nests timings inside usage on some builds.
+        if isinstance(self.usage, dict) and self.usage.get('timings') and not self.timings:
+            self.timings = self.usage['timings']
+        choices = ev.get('choices') or []
+        if not choices or not isinstance(choices[0], dict):
+            return None
+        ch = choices[0]
+        if ch.get('finish_reason'):
+            self.finish = ch['finish_reason']
+        delta = ch.get('delta') or {}
+        if not isinstance(delta, dict):
+            self.malformed += 1
+            return None
+        accumulate_tool_calls(delta.get('tool_calls'), self.tool_acc)
+        rc = delta.get('reasoning_content') or delta.get('reasoning')
+        if rc:
+            self.reason.append(rc)
+            self.chunks += 1
+            self.first_token_at = self.first_token_at or time.monotonic()
+            return {'kind': 'reasoning', 'text': rc}
+        ct = delta.get('content')
+        if ct:
+            self.text.append(ct)
+            self.chunks += 1
+            self.first_token_at = self.first_token_at or time.monotonic()
+            return {'kind': 'delta', 'text': ct}
+        return None
+
+    def message(self):
+        """The assistant message assembled so far, in OpenAI wire shape."""
+        msg = {'role': 'assistant', 'content': ''.join(self.text)}
+        if ''.join(self.reason):
+            msg['reasoning_content'] = ''.join(self.reason)
+        calls = self.tool_calls()
+        if calls:
+            msg['tool_calls'] = calls
+            msg['content'] = msg['content'] or None
+        return msg
+
+    def tool_calls(self):
+        return [self.tool_acc[k] for k in sorted(self.tool_acc)]
+
+    def done_event(self):
+        return {'kind': 'done', 'message': self.message(), 'tool_calls': self.tool_calls(),
+                'finish_reason': self.finish, 'usage': self.usage, 'timings': self.timings,
+                'elapsed': time.monotonic() - self.started,
+                'ttft': (self.first_token_at - self.started) if self.first_token_at else None,
+                'chunks': self.chunks, 'model': self.model}
+
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        try:
+            while True:
+                chunk = self._read_chunk()
+                if not chunk:
+                    break
+                for payload in self.decoder.feed(chunk):
+                    ev = self._event(payload)
+                    if ev is _DONE:
+                        self.done = True
+                        self.drain()
+                        yield self.done_event()
+                        return
+                    if ev is not None:
+                        yield ev
+            tail = self.decoder.close()
+            if tail is not None:
+                ev = self._event(tail)
+                if ev is not None and ev is not _DONE:
+                    yield ev
+            self.done = True
+            self.drained = True          # natural EOF: the body is fully consumed
+            yield self.done_event()
+        except GeneratorExit:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            self.interrupted = 'cancelled'
+            raise
+        except Exception as e:
+            # The server went away mid-generation, or the tunnel dropped the stream.
+            # Report what we have instead of pretending the turn completed.
+            self.interrupted = f'{type(e).__name__}: {e}'
+            raise StreamInterrupted(
+                f'stream ended early after {self.chunks} chunk(s): {type(e).__name__}: {e}',
+                partial_text=''.join(self.text), partial_reasoning=''.join(self.reason),
+                reason=type(e).__name__) from None
+        finally:
+            self.close()
+
+    def _read_chunk(self):
+        """Read whatever is available now, without blocking for a full buffer.
+
+        `read(n)` on http.client blocks until it has n bytes, which would sit on the
+        socket after the last small chunk instead of handing us the token we already
+        have — that alone was enough to add a whole round-trip of apparent latency to
+        every stream. `read1` returns as soon as one chunk is buffered.
+        """
+        reader = getattr(self.resp, 'read1', None)
+        if reader is not None:
+            return reader(65536)
+        return self.resp.read(65536)
+
+    def _event(self, payload):
+        if payload is None:
+            return None
+        if payload.strip() == '[DONE]':
+            return _DONE
+        try:
+            ev = json.loads(payload)
+        except ValueError:
+            self.malformed += 1
+            return None
+        return self._handle(ev)
+
+
+_DONE = object()
 
 
 # ======================================================================
@@ -1232,6 +2092,18 @@ class ToolError(BonsaiError):
     """A tool refused or failed; the message goes back to the model so it can recover."""
 
 
+class ToolTimeout(ToolError):
+    """A tool call exceeded its wall-clock budget and was abandoned.
+
+    The worker thread is not killed (Python cannot do that safely); it is left to finish
+    on its own and the model is told the call timed out, which is the honest outcome.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        super().__init__(f'tool exceeded its {timeout:.0f}s budget')
+
+
 @dataclass
 class Tool:
     name: str
@@ -1279,6 +2151,16 @@ class ToolContext:
         if resolved != root and root not in resolved.parents:
             raise ToolError(f'{path} is outside the sandbox ({root}); refusing.')
         return resolved
+
+    def truncate_to(self, text, limit):
+        """Cap tool output at `limit` characters, saying so, so the model is not misled."""
+        if limit is None or limit <= 0 or len(text) <= limit:
+            return text
+        head = limit * 3 // 4
+        tail = limit // 4
+        return (text[:head] +
+                f'\n… [{len(text) - head - tail} characters omitted to stay inside the '
+                f'{limit}-character tool output limit] …\n' + text[-tail:])
 
     def truncate(self, text):
         text = str(text)
@@ -1342,6 +2224,8 @@ class ToolRegistry:
     def __init__(self, ctx: ToolContext):
         self.ctx = ctx
         self.tools = {}
+        self.calls_run = 0
+        self.last_duration = 0.0
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -1563,8 +2447,13 @@ class ToolRegistry:
             raise ToolError('arguments must be a JSON object')
         return parsed
 
-    def execute(self, name, raw_args):
-        """Run one tool call; always returns a string for the model (errors included)."""
+    def execute(self, name, raw_args, timeout=None, max_output=None):
+        """Run one tool call; always returns a string for the model (errors included).
+
+        `timeout` bounds a single call and `max_output` bounds what is fed back, so a tool
+        that hangs or dumps a 50 MB log cannot stall or overflow the turn. Approval is
+        asked *before* the timed section — a prompt waiting on the user is not a hang.
+        """
         tool = self.tools.get(name)
         if tool is None:
             return f'ERROR: unknown tool {name!r}. Available: {", ".join(self.names())}'
@@ -1578,13 +2467,49 @@ class ToolRegistry:
             return (f'DENIED: the user declined to run {name} with {json.dumps(args)[:300]}. '
                     'Do not retry it; answer with what you already know.')
         self.ctx.say(f'⚙ {name} {json.dumps(args, ensure_ascii=False)[:200]}')
+        started = time.monotonic()
         try:
-            result = tool.func(args)
+            result = self._call(tool.func, args, timeout)
+        except ToolTimeout:
+            # Must precede the generic ToolError handler: ToolTimeout subclasses it.
+            return (f'ERROR: {name} was still running after {timeout:.0f}s and was abandoned. '
+                    'Report that it timed out; do not retry it.')
         except ToolError as e:
             return f'ERROR: {e}'
         except Exception as e:
             return f'ERROR: {type(e).__name__}: {e}'
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, default=str)
+        self.last_duration = time.monotonic() - started
+        self.calls_run += 1
+        return self.ctx.truncate_to(result, max_output) if max_output else result
+
+    @staticmethod
+    def _call(func, args, timeout):
+        """Run `func` with a wall-clock bound.
+
+        The function runs in a daemon thread so a hung tool cannot wedge the chat loop.
+        The thread is not killed (Python cannot do that safely); it is abandoned and the
+        model is told the call timed out, which is the honest outcome.
+        """
+        if not timeout or timeout <= 0:
+            return func(args)
+        box = {}
+
+        def runner():
+            try:
+                box['value'] = func(args)
+            except BaseException as e:      # noqa: BLE001 - surfaced to the model
+                box['error'] = e
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise ToolTimeout(timeout)
+        if 'error' in box:
+            raise box['error']
+        return box.get('value')
 
 
 # ======================================================================
@@ -1599,36 +2524,198 @@ DEFAULT_SYSTEM = (
 
 WIRE_ROLES = ('system', 'user', 'assistant', 'tool')
 
+# Session files carry a schema marker so a future version can tell an old file from a
+# corrupt one. Files without the marker are still readable (v0.3/v0.4 wrote bare JSONL).
+SESSION_SCHEMA = 2
 
-@dataclass
+
 class Settings:
-    model: str = DEFAULT_MODEL
-    temperature: float = 1.0
-    top_p: float = 0.95
-    max_tokens: int = 2048
-    effort: str = 'medium'       # none|low|medium|high -> reasoning_effort
-    stream: bool = True
-    use_tools: bool = True
-    markdown: bool = True
-    highlight: bool = True
-    max_tool_rounds: int = 6
-    context_budget: float = 0.75
+    """Everything the user can change about a turn, in one place.
 
-    def api_params(self):
+    `reasoning` (a ReasoningConfig) is the single source of truth for thinking; `effort`
+    and `think` are accessors over it so older callers, the `/effort` command and the
+    `effort=`/`think=` constructor keywords all keep working without a second copy of the
+    state to fall out of sync.
+    """
+
+    def __init__(self, model=DEFAULT_MODEL, temperature=1.0, top_p=0.95, max_tokens=2048,
+                 reasoning=None, effort=None, think=None, stream=True, use_tools=True,
+                 markdown=True, highlight=True, max_tool_rounds=6, context_budget=0.75,
+                 context_reserve=512, output_reserve=1024, tool_timeout=60.0,
+                 tool_budget=600.0, tool_max_output=24000, autosave_every=1,
+                 show_stats=False):
+        self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self.reasoning = reasoning or ReasoningConfig('medium', 'medium', 'compact')
+        if effort is not None:
+            self.effort = effort
+        if think is not None:
+            self.think = think
+        self.stream = stream
+        self.use_tools = use_tools
+        self.markdown = markdown
+        self.highlight = highlight
+        self.max_tool_rounds = max_tool_rounds
+        self.context_budget = context_budget
+        self.context_reserve = context_reserve      # tokens for the chat template
+        self.output_reserve = output_reserve        # tokens for the answer being written
+        self.tool_timeout = tool_timeout            # per tool call
+        self.tool_budget = tool_budget              # total wall clock for one turn's tools
+        self.tool_max_output = tool_max_output      # characters fed back per call
+        self.autosave_every = autosave_every        # turns between session writes
+        self.show_stats = show_stats                # /speed: always print the timing table
+
+    def __repr__(self):
+        return (f'Settings(model={self.model!r}, temperature={self.temperature}, '
+                f'top_p={self.top_p}, max_tokens={self.max_tokens}, '
+                f'reasoning={self.reasoning.describe()!r}, stream={self.stream}, '
+                f'use_tools={self.use_tools})')
+
+    # -- reasoning accessors ---------------------------------------------------
+    @property
+    def effort(self):
+        return self.reasoning.effort or 'none'
+
+    @effort.setter
+    def effort(self, value):
+        v = str(value or '').lower()
+        if v in ('none', 'off', ''):
+            self.reasoning.level = 'off'
+            self.reasoning.effort = None
+        else:
+            self.reasoning.effort = parse_effort(v)
+            if self.reasoning.level == 'off':
+                self.reasoning.level = 'medium'
+
+    @property
+    def think(self):
+        return self.reasoning.level
+
+    @think.setter
+    def think(self, value):
+        self.reasoning.level = parse_think_level(value)
+
+    # --------------------------------------------------------------------------
+    def api_params(self, caps=None):
+        """Sampling + reasoning fields for one request, filtered by real capability."""
         params = {'temperature': self.temperature, 'top_p': self.top_p,
                   'max_tokens': self.max_tokens}
-        if self.effort and self.effort != 'none':
-            params['reasoning_effort'] = self.effort
-        return params
+        fields, _ = self.reasoning.wire(caps)
+        params.update(fields)
+        return {k: v for k, v in params.items() if v is not None}
+
+    def reasoning_notes(self, caps=None):
+        return self.reasoning.wire(caps)[1]
+
+
+class TurnStats:
+    """Measured numbers for one turn. Every field is either measured or absent.
+
+    Nothing here is estimated: if the server did not report a value, the property returns
+    None and the UI prints `n/a` rather than a plausible-looking number.
+    """
+
+    def __init__(self):
+        self.ttft = None
+        self.elapsed = 0.0
+        self.prompt_tokens = None
+        self.completion_tokens = None
+        self.reasoning_tokens = None
+        self.prompt_tokens_per_s = None
+        self.tokens_per_s = None
+        self.rounds = 0
+        self.tool_calls = 0
+        self.cancelled = False
+        self.interrupted = None
+        self.context_used = None
+        self.context_window = None
+
+    # ------------------------------------------------------------------
+    def absorb(self, usage=None, timings=None, ttft=None, elapsed=0.0):
+        usage = usage or {}
+        timings = dict(timings or {})
+        # Some builds nest the timing block inside usage instead of at the top level.
+        if isinstance(usage.get('timings'), dict):
+            for k, v in usage['timings'].items():
+                timings.setdefault(k, v)
+        if usage.get('prompt_tokens'):
+            self.prompt_tokens = usage['prompt_tokens']
+        if usage.get('completion_tokens'):
+            self.completion_tokens = usage['completion_tokens']
+        rc = usage.get('reasoning_tokens')
+        if rc is None and isinstance(usage.get('completion_tokens_details'), dict):
+            rc = usage['completion_tokens_details'].get('reasoning_tokens')
+        if rc:
+            self.reasoning_tokens = rc
+        self.ttft = self.ttft if self.ttft is not None else ttft
+        self.elapsed += elapsed or 0.0
+        for src, dst in (('prompt_per_second', 'prompt_tokens_per_s'),
+                         ('tokens_per_second', 'tokens_per_s'),
+                         ('predicted_per_second', 'tokens_per_s'),
+                         ('prompt_n', '_pn'), ('predicted_n', '_gn')):
+            v = timings.get(src)
+            if v and dst != '_pn' and dst != '_gn':
+                setattr(self, dst, float(v))
+        # Fall back to the server's own token/ms timings when it does not send rates.
+        if self.tokens_per_s is None and timings.get('predicted_ms') and (
+                timings.get('predicted_n') or self.completion_tokens):
+            n = timings.get('predicted_n') or self.completion_tokens
+            self.tokens_per_s = float(n) / (float(timings['predicted_ms']) / 1000.0)
+        if self.prompt_tokens_per_s is None and timings.get('prompt_ms') and (
+                timings.get('prompt_n') or self.prompt_tokens):
+            n = timings.get('prompt_n') or self.prompt_tokens
+            self.prompt_tokens_per_s = float(n) / (float(timings['prompt_ms']) / 1000.0)
+
+    def rate(self):
+        if self.tokens_per_s:
+            return float(self.tokens_per_s)
+        if self.elapsed and self.completion_tokens:
+            # Wall-clock fallback: includes network and tool time, so it is labelled as
+            # such by the caller and never printed as a decode rate.
+            return self.completion_tokens / self.elapsed
+        return 0.0
+
+    @property
+    def total_tokens(self):
+        if self.prompt_tokens is None and self.completion_tokens is None:
+            return None
+        return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
+
+    def context_utilization(self):
+        if not self.context_window or self.context_used is None:
+            return None
+        return 100.0 * self.context_used / self.context_window
+
+    def to_dict(self):
+        return {'ttft_ms': round(self.ttft * 1000, 1) if self.ttft else None,
+                'elapsed_s': round(self.elapsed, 3),
+                'prompt_tokens': self.prompt_tokens,
+                'completion_tokens': self.completion_tokens,
+                'reasoning_tokens': self.reasoning_tokens,
+                'total_tokens': self.total_tokens,
+                'prompt_tokens_per_s': round(self.prompt_tokens_per_s, 1)
+                if self.prompt_tokens_per_s else None,
+                'tokens_per_s': round(self.tokens_per_s, 2) if self.tokens_per_s else None,
+                'rounds': self.rounds, 'tool_calls': self.tool_calls,
+                'cancelled': self.cancelled, 'interrupted': self.interrupted,
+                'context_used': self.context_used, 'context_window': self.context_window}
 
 
 class Conversation:
     """Message history with token-budget trimming that never orphans a tool result."""
 
+    #: bumped when the on-disk session format changes in an incompatible way
+    SCHEMA = SESSION_SCHEMA
+
     def __init__(self, system=DEFAULT_SYSTEM, counter=None):
         self.counter = counter or TokenCounter()
         self.messages = []
         self.system_text = None
+        self.schema = SESSION_SCHEMA
+        self.saved_version = None
+        self.skipped_lines = 0
         if system:
             self.set_system(system)
 
@@ -1690,24 +2777,13 @@ class Conversation:
     def tokens(self):
         return self.counter.messages(self.wire())
 
-    def trim(self, budget):
-        """Drop the oldest complete turns until the history fits `budget` tokens.
-
-        Removal happens per turn group (a user message plus the assistant/tool messages that
-        answer it), so a `tool` message can never survive without the `tool_calls` it belongs
-        to — that combination makes llama.cpp reject the whole request.
-        """
-        dropped = 0
-        while self.tokens() > budget and len(self.messages) > 2:
-            start = 1 if (self.messages and self.messages[0]['role'] == 'system') else 0
-            end = start + 1
-            while end < len(self.messages) and self.messages[end]['role'] != 'user':
-                end += 1
-            if end >= len(self.messages):
-                break
-            del self.messages[start:end]
-            dropped += end - start
-        return dropped
+    def truncate(self, index):
+        """Cut the history back to `index` messages."""
+        if index < len(self.messages):
+            removed = len(self.messages) - index
+            del self.messages[index:]
+            return removed
+        return 0
 
     def drop_last_turn(self):
         """Remove the newest user turn and everything after it (for /undo and /retry)."""
@@ -1718,30 +2794,213 @@ class Conversation:
         del self.messages[i:]
         return removed
 
+    def turn_groups(self):
+        """Split the history into (start, end) spans, one per user turn.
+
+        A group is a user message plus every assistant/tool message that answers it. All
+        removal happens at group granularity: dropping anything finer can orphan a `tool`
+        message from the `tool_calls` it belongs to, and llama.cpp rejects the whole
+        request when that happens.
+        """
+        start = 0
+        while start < len(self.messages) and self.messages[start]['role'] == 'system':
+            start += 1                     # system + any compaction digest are never dropped
+        groups = []
+        begin = start
+        for i in range(start + 1, len(self.messages)):
+            if self.messages[i]['role'] == 'user':
+                if i > begin:
+                    groups.append((begin, i))
+                begin = i
+        if begin < len(self.messages):
+            groups.append((begin, len(self.messages)))
+        return groups
+
+    def trim(self, budget):
+        """Drop the oldest complete turns until the history fits `budget` tokens.
+
+        Removal happens per turn group so a `tool` message can never survive without the
+        `tool_calls` it belongs to. Token counts come from the counter's cache, so the
+        repeated re-measurement inside this loop costs one server round trip per new
+        string, not one per iteration.
+        """
+        dropped = 0
+        while self.tokens() > budget and len(self.messages) > 2:
+            groups = self.turn_groups()
+            if not groups:
+                break
+            start, end = groups[0]
+            del self.messages[start:end]
+            dropped += end - start
+        return dropped
+
+    def compact(self, budget, keep_recent=2, summarizer=None):
+        """Compact old turns into a single system-visible digest instead of dropping them.
+
+        `trim` throws history away; `compact` preserves what it can. The oldest turns are
+        summarised (by `summarizer`, else by a cheap extractive digest) and folded into a
+        `[earlier in this conversation]` block placed after the system message. The most
+        recent `keep_recent` turns, the system prompt and every tool pair in the kept
+        region are preserved verbatim.
+
+        Returns a dict describing what happened so the UI can tell the user.
+        """
+        groups = self.turn_groups()
+        if len(groups) <= keep_recent:
+            return {'compacted': 0, 'kept': len(groups), 'tokens_before': self.tokens(),
+                    'tokens_after': self.tokens()}
+        before = self.tokens()
+        keep_from = groups[-keep_recent][0] if keep_recent else len(self.messages)
+        old = self.messages[1 if (self.messages and self.messages[0]['role'] == 'system')
+                            else 0:keep_from]
+        digest = (summarizer(old) if summarizer else self._extractive_digest(old))
+        head = 0
+        while head < len(self.messages) and self.messages[head]['role'] == 'system':
+            head += 1
+        self.messages = (self.messages[:head] +
+                         [{'role': 'system',
+                           'content': ('[earlier in this conversation — compacted]\n' + digest)}] +
+                         self.messages[keep_from:])
+        after = self.tokens()
+        # Still over budget after compaction? Fall back to whole-turn trimming.
+        dropped = self.trim(budget) if after > budget else 0
+        return {'compacted': len(old), 'kept': keep_recent, 'tokens_before': before,
+                'tokens_after': self.tokens(), 'trimmed': dropped}
+
+    @staticmethod
+    def _extractive_digest(messages):
+        """A cheap, honest digest: who said what, first line only. No model call."""
+        lines = []
+        for m in messages:
+            body = m.get('content')
+            if isinstance(body, list):
+                body = ' '.join(p.get('text', '') for p in body if isinstance(p, dict))
+            body = ' '.join((body or '').split())
+            role = m['role']
+            if role == 'user':
+                lines.append('- user: ' + body[:200])
+            elif role == 'assistant':
+                if m.get('tool_calls'):
+                    names = ', '.join((tc.get('function') or {}).get('name', '?')
+                                      for tc in m['tool_calls'])
+                    lines.append(f'- assistant called tool(s): {names}')
+                elif body:
+                    lines.append('- assistant: ' + body[:200])
+            elif role == 'tool':
+                lines.append(f'- tool {m.get("name") or m.get("tool_call_id")}: ' + body[:120])
+        return '\n'.join(lines) or '(nothing recorded)'
+
+    def validate_wire(self):
+        """Check the outgoing message list for the things llama.cpp rejects.
+
+        Returns a list of human-readable problems. Cheap enough to run before every
+        request, and it turns a confusing server-side 400 into a precise local message.
+        """
+        problems = []
+        wire = self.wire()
+        pending = set()
+        for i, m in enumerate(wire):
+            role = m.get('role')
+            if role == 'assistant' and m.get('tool_calls'):
+                for tc in m['tool_calls']:
+                    pending.add(tc.get('id'))
+            if role == 'tool':
+                cid = m.get('tool_call_id')
+                if cid not in pending:
+                    problems.append(f'message {i}: orphan tool result (no matching tool_call '
+                                    f'for id {cid!r})')
+                else:
+                    pending.discard(cid)
+            if role == 'assistant' and not m.get('tool_calls') and not m.get('content'):
+                problems.append(f'message {i}: empty assistant message')
+        if pending:
+            problems.append(f'unanswered tool_call(s): {", ".join(sorted(str(p) for p in pending))}')
+        return problems
+
     # ------------------------------------------------------------------
     def save(self, path):
+        """Atomic write: temp file in the same directory, fsync, then rename.
+
+        A notebook runtime can be killed at any moment; a torn session file must not cost
+        the user their conversation.
+        """
         path = Path(path).expanduser()
         tmp = path.with_suffix(path.suffix + '.tmp')
         with tmp.open('w', encoding='utf-8') as fh:
+            fh.write(json.dumps({'_meta': True, 'schema': SESSION_SCHEMA,
+                                 'version': VERSION,
+                                 'saved_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())},
+                                ensure_ascii=False) + '\n')
             for m in self.messages:
                 fh.write(json.dumps(m, ensure_ascii=False) + '\n')
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return path
 
     @classmethod
-    def load(cls, path, counter=None):
+    def load(cls, path, counter=None, on_error=None):
+        """Load a session file, tolerating corruption and older formats.
+
+        A truncated last line (killed mid-write), a stray blank, or a file from an older
+        schema must not crash the client. Bad lines are skipped and reported; the rest of
+        the conversation is kept.
+        """
         path = Path(path).expanduser()
         conv = cls(system=None, counter=counter)
-        for line in path.read_text(encoding='utf-8').splitlines():
+        skipped = 0
+        for lineno, line in enumerate(path.read_text(encoding='utf-8', errors='replace')
+                                   .splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                skipped += 1
+                continue
+            if not isinstance(msg, dict):
+                skipped += 1
+                continue
+            if msg.get('_meta'):
+                conv.schema = msg.get('schema', 1)
+                conv.saved_version = msg.get('version')
+                continue
+            if msg.get('role') not in WIRE_ROLES:
+                skipped += 1
+                continue
             if msg.get('role') == 'system' and not conv.messages:
                 conv.set_system(msg.get('content') or '')
             else:
                 conv.messages.append(msg)
+        conv.skipped_lines = skipped
+        if skipped and on_error:
+            on_error(skipped)
+        # Drop anything that would be rejected by the server, e.g. a tool result whose
+        # assistant tool_call line was the one that got truncated away.
+        conv._repair_orphans()
         return conv
+
+    def _repair_orphans(self):
+        """Remove tool results with no matching tool_call, and vice versa."""
+        known = set()
+        for m in self.messages:
+            for tc in m.get('tool_calls') or []:
+                known.add(tc.get('id'))
+        self.messages = [m for m in self.messages
+                         if m.get('role') != 'tool' or m.get('tool_call_id') in known]
+        answered = {m.get('tool_call_id') for m in self.messages if m.get('role') == 'tool'}
+        for m in self.messages:
+            if m.get('tool_calls'):
+                m['tool_calls'] = [tc for tc in m['tool_calls'] if tc.get('id') in answered]
+                if not m['tool_calls']:
+                    m.pop('tool_calls', None)
+                    if not m.get('content'):
+                        m['content'] = ''
 
     def export_markdown(self, path, title='Bonsai session'):
         lines = [f'# {title}', '']
@@ -1781,6 +3040,7 @@ def mask_key(key):
 
 @dataclass
 class TurnResult:
+    """What one user turn produced. `stats` holds the measured numbers."""
     text: str = ''
     reasoning: str = ''
     tool_calls: list = field(default_factory=list)
@@ -1791,30 +3051,34 @@ class TurnResult:
     ttft: float = 0.0
     rounds: int = 0
     cancelled: bool = False
+    interrupted: str = ''
+    stats: TurnStats = field(default_factory=TurnStats)
 
     @property
     def prompt_tokens(self):
-        return (self.usage or {}).get('prompt_tokens') or 0
+        return self.stats.prompt_tokens or 0
 
     @property
     def completion_tokens(self):
-        return (self.usage or {}).get('completion_tokens') or 0
+        return self.stats.completion_tokens or 0
 
     def rate(self):
-        t = (self.timings or {}).get('tokens_per_second')
-        if t:
-            return float(t)
-        decode = (self.timings or {}).get('predicted_ms')
-        n = (self.timings or {}).get('predicted_n') or self.completion_tokens
-        if decode and n:
-            return float(n) / (float(decode) / 1000.0)
-        if self.elapsed and self.completion_tokens:
-            return self.completion_tokens / self.elapsed
-        return 0.0
+        return self.stats.rate()
 
 
 class Agent:
-    """Drives one turn: stream the answer, run any tool calls, feed results back, repeat."""
+    """Drives one turn: stream the answer, run any tool calls, feed results back, repeat.
+
+    Three guarantees this class is responsible for:
+
+    1. Reasoning never becomes answer text. `reasoning_content` is collected separately
+       and is never written into the assistant history as `content`.
+    2. A cancelled or interrupted generation never becomes a completed assistant message.
+       Whatever the model produced this turn is rolled back, the user's message stays, and
+       the user is told exactly what happened.
+    3. The tool loop is bounded — by rounds, by per-call time, by total wall clock, and by
+       the size of what gets fed back — so an agentic loop cannot run away.
+    """
 
     def __init__(self, client, settings, registry=None, counter=None,
                  on_delta=None, on_reasoning=None, on_tool=None, on_notice=None):
@@ -1843,118 +3107,227 @@ class Agent:
             message = {'role': 'user', 'content': text or ''}
         if not regenerate:
             conversation.add(message)
+        # Everything from here on is produced by the model; a cancel rolls back to this
+        # mark so no half-written tool group can survive into the history.
+        rollback_mark = len(conversation.messages)
 
         tools = self.registry.schemas() if (self.registry and settings.use_tools) else None
+        for note in settings.reasoning_notes(self.client.caps):
+            self.on_notice(note)
         result = TurnResult()
         cancelled = False
-        for round_no in range(1, settings.max_tool_rounds + 1):
-            result.rounds = round_no
-            try:
-                assistant, usage, timings, finish, elapsed, ttft, cancelled = self._one_request(
-                    conversation.wire(), tools)
-            except CancelledByUser:
-                cancelled = True
-                assistant = {'role': 'assistant', 'content': result.text or '[cancelled]'}
-                usage, timings, finish, elapsed, ttft = {}, {}, 'cancelled', 0.0, None
-            result.usage = usage or result.usage
-            result.timings = timings or result.timings
-            result.finish_reason = finish or result.finish_reason
-            result.elapsed += elapsed or 0.0
-            result.ttft = result.ttft or ttft or 0.0
-            conversation.add_assistant(assistant)
-            if assistant.get('reasoning_content'):
-                result.reasoning = ((result.reasoning + '\n') if result.reasoning else '') + \
-                    assistant['reasoning_content']
-            calls = assistant.get('tool_calls') or []
-            if not calls:
-                result.text = assistant.get('content') or ''
-                break
-            result.tool_calls.extend(calls)
-            if round_no >= settings.max_tool_rounds:
-                self.on_notice(f'stopped after {round_no} tool rounds (raise --max-tool-rounds)')
-                result.text = assistant.get('content') or ''
-                break
-            for call in calls:
-                fn = call.get('function') or {}
-                name = fn.get('name') or '?'
-                answer = self.registry.execute(name, fn.get('arguments')) if self.registry else \
-                    'ERROR: tools are disabled'
-                conversation.add_tool_result(call.get('id') or f'call_{round_no}', answer, name)
-                self.on_tool(name, fn.get('arguments') or '', answer)
-            if cancelled:
-                break
+        interrupted = ''
+        turn_started = time.monotonic()
+        try:
+            for round_no in range(1, settings.max_tool_rounds + 1):
+                result.rounds = round_no
+                result.stats.rounds = round_no
+                assistant, usage, timings, finish = self._one_request(
+                    conversation.wire(), tools, result.stats)
+                conversation.add_assistant(assistant)
+                if finish:
+                    result.finish_reason = finish
+                if assistant.get('reasoning_content'):
+                    result.reasoning = ((result.reasoning + '\n') if result.reasoning else '') + \
+                        assistant['reasoning_content']
+                calls = assistant.get('tool_calls') or []
+                if not calls:
+                    result.text = assistant.get('content') or ''
+                    break
+                result.tool_calls.extend(calls)
+                if round_no >= settings.max_tool_rounds:
+                    self.on_notice(f'stopped after {round_no} tool rounds (raise --max-tool-rounds)')
+                    result.text = assistant.get('content') or ''
+                    break
+                over_budget = False
+                for call in calls:
+                    fn = call.get('function') or {}
+                    name = fn.get('name') or '?'
+                    if time.monotonic() - turn_started > settings.tool_budget:
+                        answer = (f'ERROR: the tool budget for this turn '
+                                  f'({settings.tool_budget:.0f}s) is exhausted; {name} was not run.')
+                        over_budget = True
+                    else:
+                        answer = self.registry.execute(
+                            name, fn.get('arguments'), timeout=settings.tool_timeout,
+                            max_output=settings.tool_max_output) if self.registry else \
+                            'ERROR: tools are disabled'
+                    conversation.add_tool_result(call.get('id') or f'call_{round_no}', answer, name)
+                    self.on_tool(name, fn.get('arguments') or '', answer)
+                if over_budget:
+                    self.on_notice('tool budget exhausted — asking the model to answer with '
+                                   'what it has')
+        except CancelledByUser:
+            cancelled = True
+            self._rollback(conversation, rollback_mark)
+            self.on_notice('cancelled — the partial answer was discarded and the history is '
+                           'unchanged (your message is still there; /retry to run it again)')
+        except StreamInterrupted as e:
+            interrupted = e.reason or 'stream interrupted'
+            self._rollback(conversation, rollback_mark)
+            self.on_notice(f'the stream ended early ({e.reason or "disconnected"}) after '
+                           f'{len(e.partial_text)} characters; nothing was added to the '
+                           'history, so no half-finished answer is remembered. Use /retry.')
         result.cancelled = cancelled
+        result.interrupted = interrupted
+        result.stats.cancelled = cancelled
+        result.stats.interrupted = interrupted or None
+        result.stats.elapsed = time.monotonic() - turn_started
+        result.elapsed = result.stats.elapsed
+        result.ttft = result.stats.ttft or 0.0
+        result.usage = {k: v for k, v in (('prompt_tokens', result.stats.prompt_tokens),
+                                          ('completion_tokens', result.stats.completion_tokens),
+                                          ('total_tokens', result.stats.total_tokens))
+                        if v is not None}
+        result.timings = {}
+        result.stats.tool_calls = len(result.tool_calls)
         return result
 
-    def _one_request(self, messages, tools):
+    @staticmethod
+    def _rollback(conversation, mark):
+        """Drop everything the model produced this turn, keeping the user's message."""
+        if len(conversation.messages) > mark:
+            del conversation.messages[mark:]
+
+    # ------------------------------------------------------------------
+    def _one_request(self, messages, tools, stats):
         settings = self.settings
-        params = settings.api_params()
+        params = settings.api_params(self.client.caps)
         if not settings.stream:
             resp = self.client.chat(messages, tools=tools, **params)
             choice = (resp.get('choices') or [{}])[0]
             msg = choice.get('message') or {}
-            usage = resp.get('usage') or {}
-            timings = resp.get('timings') or {}
             finish = choice.get('finish_reason') or ''
+            stats.absorb(resp.get('usage'), resp.get('timings'), ttft=None, elapsed=0.0)
             text = msg.get('content') or ''
             if text:
                 self.on_delta(text)
-            return msg, usage, timings, finish, 0.0, None, False
-        text_parts, reason_parts = [], []
-        cancelled = False
-        stream = self.client.stream_chat(messages, tools=tools, **params)
-        try:
-            for ev in stream:
-                if ev['kind'] == 'delta':
-                    text_parts.append(ev['text'])
-                    self.on_delta(ev['text'])
-                elif ev['kind'] == 'reasoning':
-                    reason_parts.append(ev['text'])
-                    self.on_reasoning(ev['text'])
-                elif ev['kind'] == 'done':
-                    return (ev['message'], ev.get('usage'), ev.get('timings'),
-                            ev.get('finish_reason'), ev.get('elapsed'), ev.get('ttft'), False)
-        except KeyboardInterrupt:
-            cancelled = True
+            rc = msg.get('reasoning_content')
+            if rc:
+                self.on_reasoning(rc)
+            return msg, resp.get('usage'), resp.get('timings'), finish
+        # `with` is not cosmetic: it closes the HTTP response the moment the turn ends,
+        # including on the `return` below. Leaving that to the garbage collector let a
+        # finished stream's unread bytes leak into the next request on the same socket.
+        with self.client.stream_chat(messages, tools=tools, **params) as stream:
             try:
-                stream.close()
-            except Exception:
-                pass
-            raise CancelledByUser() from None
-        msg = {'role': 'assistant', 'content': ''.join(text_parts)}
-        return msg, None, None, None, 0.0, None, cancelled
+                for ev in stream:
+                    if ev['kind'] == 'delta':
+                        self.on_delta(ev['text'])
+                    elif ev['kind'] == 'reasoning':
+                        self.on_reasoning(ev['text'])
+                    elif ev['kind'] == 'done':
+                        self.client.note_accepted(stream.sent_fields)
+                        stats.absorb(ev.get('usage'), ev.get('timings'),
+                                     ttft=ev.get('ttft'), elapsed=ev.get('elapsed') or 0.0)
+                        return (ev['message'], ev.get('usage'), ev.get('timings'),
+                                ev.get('finish_reason'))
+            except KeyboardInterrupt:
+                stats.cancelled = True
+                raise CancelledByUser() from None
+            msg = {'role': 'assistant', 'content': stream.message().get('content', '')}
+            stats.absorb(None, None, ttft=None, elapsed=0.0)
+            return msg, None, None, None
 
 
 # ======================================================================
 # Live output
 # ======================================================================
 class LiveRenderer:
-    """Streams reasoning + answer to the terminal, rendering Markdown as blocks complete."""
+    """Streams reasoning + answer to the terminal, rendering Markdown as blocks complete.
 
-    def __init__(self, style, markdown=True, highlight=False, out=None):
+    Output is coalesced. Flushing once per token turns a 40 tok/s stream into 40 write(2)
+    calls per second *plus* a terminal repaint each, which is measurably more expensive
+    than the generation itself on a busy notebook. Instead we buffer and flush when either
+    FLUSH_MIN_CHARS have accumulated or FLUSH_MAX_DELAY has passed — real-time to the eye,
+    a small fraction of the syscalls.
+    """
+
+    def __init__(self, style, markdown=True, highlight=False, out=None,
+                 reasoning_display='compact', coalesce=True):
         self.style = style
         self.out = out if out is not None else sys.stdout
         self.markdown = markdown
         self.writer = MarkdownWriter(style, highlight=highlight) if markdown else None
+        self.reasoning_display = reasoning_display
+        self.coalesce = coalesce
         self._reason_open = False
+        self._buf = []
+        self._buf_len = 0
+        self._last_flush = time.monotonic()
+        self.reasoning_chars = 0
+        self.answer_chars = 0
 
-    def write(self, text):
-        self.out.write(text)
-        self.out.flush()
+    # ------------------------------------------------------------------
+    def write(self, text, force=False):
+        """Buffered write; flushes on size, on age, or when forced."""
+        if not text:
+            return
+        self._buf.append(text)
+        self._buf_len += len(text)
+        now = time.monotonic()
+        if (force or not self.coalesce or self._buf_len >= FLUSH_MIN_CHARS or
+                now - self._last_flush >= FLUSH_MAX_DELAY):
+            self.flush()
 
+    def flush(self):
+        if not self._buf:
+            self._last_flush = time.monotonic()
+            return
+        try:
+            self.out.write(''.join(self._buf))
+            self.out.flush()
+        except (BrokenPipeError, ValueError):
+            pass                      # reader went away; nothing useful left to do
+        self._buf = []
+        self._buf_len = 0
+        self._last_flush = time.monotonic()
+
+    # ------------------------------------------------------------------
     def notice(self, text):
-        self.write(self.style.dim('· ' + text) + '\n')
+        self.flush()
+        self.write(self.style.dim('· ' + text) + '\n', force=True)
 
     def reasoning(self, text):
+        self.reasoning_chars += len(text)
+        if self.reasoning_display == 'hidden':
+            return
         if not self._reason_open:
-            self.write(self.style.dim('✻ thinking …\n'))
             self._reason_open = True
-        self.write(self.style.paint(text, 2))
+            if self.reasoning_display == 'full':
+                self.write(self.style.dim('✻ thinking …\n'))
+        if self.reasoning_display == 'full':
+            self.write(self.style.paint(text, 2))
+        else:
+            # 'compact' shows a one-line indicator instead of the trace; the token count
+            # is printed with the turn's stats. That keeps the answer area clean on the
+            # long thinking traces this model produces by default.
+            self.reasoning_progress(f'({self.reasoning_chars} chars)')
+
+    def reasoning_progress(self, text=''):
+        """One-line compact indicator, redrawn in place when the terminal allows it."""
+        if self.reasoning_display != 'compact':
+            return
+        if not self._reason_open:
+            self._reason_open = True
+        label = f'✻ thinking {text}'.rstrip()
+        if getattr(self.out, 'isatty', lambda: False)():
+            self.write('\r\033[K' + self.style.dim(label), force=True)
+        elif not self._compact_line_open:
+            self._compact_line_open = True
+            self.write(self.style.dim('✻ thinking …'), force=True)
+
+    _compact_line_open = False
 
     def delta(self, text):
         if self._reason_open:
-            self.write('\n\n')
+            if self.reasoning_display == 'compact' and getattr(self.out, 'isatty', lambda: False)():
+                self.write('\r\033[K', force=True)
+            else:
+                self.write('\n\n' if self.reasoning_display == 'full' else '\n', force=True)
             self._reason_open = False
+            self._compact_line_open = False
+        self.answer_chars += len(text)
         if self.writer:
             self.write(self.writer.feed(text))
         else:
@@ -1965,34 +3338,131 @@ class LiveRenderer:
         if len(shown) > 240:
             shown = shown[:240] + ' …'
         self.write('\n' + self.style.yellow('⚙ ' + name) + self.style.dim(' ' + str(args)[:160]) +
-                   '\n' + self.style.dim('  ↳ ' + shown) + '\n\n')
+                   '\n' + self.style.dim('  ↳ ' + shown) + '\n\n', force=True)
+
+    def error(self, text):
+        self.flush()
+        self.write(self.style.red('✗ ' + text) + '\n', force=True)
 
     def finish(self):
         if self._reason_open:
-            self.write('\n')
+            if self.reasoning_display == 'compact' and getattr(self.out, 'isatty', lambda: False)():
+                self.write('\r\033[K', force=True)
+            elif self.reasoning_display == 'full':
+                self.write('\n', force=True)
             self._reason_open = False
+            self._compact_line_open = False
         if self.writer:
             self.write(self.writer.finish())
-        self.write('\n')
+        self.write('\n', force=True)
+        self.flush()
+
+    def reset_turn(self):
+        self.reasoning_chars = 0
+        self.answer_chars = 0
+
+
+def format_stats(stats, style, context=None):
+    """One-line or multi-line timing summary. Only measured values are printed.
+
+    Anything the server did not report is printed as `n/a`; a rate derived from wall-clock
+    time is labelled `~` so it is never mistaken for a decode rate.
+    """
+    def num(v, fmt='{:.1f}'):
+        return fmt.format(v) if v else 'n/a'
+    parts = []
+    parts.append(f'ttft {num(stats.ttft * 1000 if stats.ttft else None, "{:.0f}")} ms'
+                 if stats.ttft else 'ttft n/a')
+    if stats.prompt_tokens is not None:
+        parts.append(f'{stats.prompt_tokens} tok in')
+    if stats.completion_tokens is not None:
+        parts.append(f'{stats.completion_tokens} tok out')
+    if stats.reasoning_tokens:
+        parts.append(f'{stats.reasoning_tokens} reasoning')
+    if stats.total_tokens:
+        parts.append(f'{stats.total_tokens} total')
+    if stats.prompt_tokens_per_s:
+        parts.append(f'prefill {stats.prompt_tokens_per_s:.0f} tok/s')
+    if stats.tokens_per_s:
+        parts.append(f'decode {stats.tokens_per_s:.1f} tok/s')
+    elif stats.rate():
+        parts.append(f'~{stats.rate():.1f} tok/s wall')
+    parts.append(f'{stats.elapsed:.1f}s')
+    if stats.tool_calls:
+        parts.append(f'{stats.tool_calls} tool call(s)')
+    if stats.rounds > 1:
+        parts.append(f'{stats.rounds} rounds')
+    util = stats.context_utilization()
+    if util is not None:
+        parts.append(f'context {util:.0f}%')
+    if stats.cancelled:
+        parts.append('cancelled')
+    if stats.interrupted:
+        parts.append('interrupted: ' + stats.interrupted)
+    return ' | '.join(parts)
+
+
+def format_stats_block(stats, style):
+    """/stats-style table, one measured value per line."""
+    rows = [('time to first token', f'{stats.ttft * 1000:.0f} ms' if stats.ttft else 'n/a'),
+            ('prompt tokens', stats.prompt_tokens if stats.prompt_tokens is not None else 'n/a'),
+            ('completion tokens',
+             stats.completion_tokens if stats.completion_tokens is not None else 'n/a'),
+            ('reasoning tokens', stats.reasoning_tokens or 'n/a'),
+            ('total tokens', stats.total_tokens if stats.total_tokens is not None else 'n/a'),
+            ('prompt speed', f'{stats.prompt_tokens_per_s:.1f} tok/s'
+             if stats.prompt_tokens_per_s else 'n/a'),
+            ('generation speed', f'{stats.tokens_per_s:.2f} tok/s'
+             if stats.tokens_per_s else 'n/a'),
+            ('total elapsed', f'{stats.elapsed:.2f} s'),
+            ('tool rounds', stats.rounds),
+            ('context used',
+             f'{stats.context_used} / {stats.context_window} '
+             f'({stats.context_utilization():.0f}%)' if stats.context_utilization() is not None
+             else 'n/a')]
+    width = max(len(k) for k, _ in rows)
+    return '\n'.join(style.dim(f'  {k.ljust(width)}  {v}') for k, v in rows)
 
 
 HELP_TEXT = """\
 Commands:
+
+Conversation
   /help                     this help
   /system <text>            replace the system prompt (empty text clears it)
   /reset                    start a fresh conversation
   /undo                     drop the last exchange
   /retry                    regenerate the previous answer
-  /image <path> [...]       attach image(s) to the next message
-  /ocr on|off               run tesseract OCR on attached images (needs pytesseract)
-  /tools                    list tools; /tools <name> on|off toggles one; /tools off all
-  /model [id]               show or change the model id
-  /temp <0..2>  /topp <0..1>  /max-tokens <n>  /effort none|low|medium|high
+  /history                  show the conversation so far
+  /cancel                   clear the queued turn (Ctrl-C interrupts a running generation)
+
+Thinking
+  /think [off|low|medium|high|max|<tokens>]
+                            thinking budget: 0 / 512 / 2048 / 8192 / unlimited
+  /effort [medium|xhigh]    reasoning_effort sent to the chat template
+  /reasoning full|compact|hidden
+                            how the thinking trace is displayed
+
+Sampling and output
+  /temp <0..2>  /topp <0..1>  /max-tokens <n>
   /stream on|off            toggle streaming
   /markdown on|off          toggle terminal Markdown rendering
+  /speed [on|off]           print the full timing table after every turn
+  /stats                    session totals + last-turn measurements
+
+Context and tools
+  /context                  window, history tokens, budget, reserves, tokenizer
+  /compact [keep_turns]     summarise old turns instead of dropping them
+  /tools                    list tools; /tools <name> on|off toggles one; /tools off all
+
+Attachments and diagnostics
+  /image <path> [...]       attach image(s) to the next message
+  /ocr on|off               run tesseract OCR on attached images (needs pytesseract)
   /vision on|off|probe      override or re-probe whether the server can see images
-  /context                  token budget, context window, message count
-  /history                  show the conversation so far
+  /caps                     what this server actually supports (supported/unsupported/unknown)
+  /doctor [--json]          live endpoint diagnostics
+  /bench [samples]          measure TTFT, prefill and decode against this endpoint
+  /model [id]               show or change the model id
   /usage                    cumulative tokens and timings for this session
   /save [file]  /load <file>  /export [file.md]
   /quit                     leave (Ctrl-D also works; Ctrl-C cancels just this turn)
@@ -2023,7 +3493,12 @@ class ChatApp:
         self.quiet = quiet
         self.pending_images = []
         self.totals = {'turns': 0, 'prompt_tokens': 0, 'completion_tokens': 0,
-                       'tool_calls': 0, 'seconds': 0.0}
+                       'reasoning_tokens': 0, 'tool_calls': 0, 'seconds': 0.0,
+                       'ttfts': [], 'rates': [], 'compactions': 0, 'cancels': 0}
+        self.last_stats = None
+        self._autosave_counter = 0
+        self.renderer.reasoning_display = settings.reasoning.display
+        self._cancelled = False
         self.agent = Agent(client, settings, registry=registry,
                            counter=conversation.counter,
                            on_delta=self.renderer.delta,
@@ -2045,11 +3520,28 @@ class ChatApp:
         models = self.client.model_ids()
         self.say(s.dim(f'model {self.client.model}  '
                        f'(served: {", ".join(models) if models else "unknown"})'))
-        self.say(s.dim(f'context {self.client.context_window()} tokens, budget '
-                       f'{int(self.client.context_window() * self.settings.context_budget)} | '
+        ctx = self.client.context_window()
+        self.say(s.dim(f'context {ctx} tokens, budget {self.context_budget_tokens()} | '
                        f'tools {"on: " + ", ".join(self.registry.names()) if self.settings.use_tools else "off"}'))
+        self.say(s.dim(f'thinking: {self.settings.reasoning.describe()} | '
+                       f'streaming {"on" if self.settings.stream else "off"} | '
+                       f'tokenizer {"server" if self.conversation.counter.using_server() else "estimate"}'))
         self.say(s.dim(f'optional extras: {extras} | /help for commands'))
         self.say()
+
+    # ------------------------------------------------------------------
+    def context_budget_tokens(self):
+        """Tokens of history we are allowed to send.
+
+        The server's context window has to hold the prompt *and* the answer, plus whatever
+        the chat template adds. Sending history right up to the window guarantees a 400 on
+        the turn that matters, so both reserves come off the top.
+        """
+        window = self.client.context_window()
+        soft = int(window * self.settings.context_budget)
+        reserve = self.settings.context_reserve + min(self.settings.max_tokens,
+                                                      self.settings.output_reserve)
+        return max(1024, min(soft, window - reserve))
 
     # ------------------------------------------------------------------
     def approve(self, name, args, risk):
@@ -2084,34 +3576,51 @@ class ChatApp:
 
     def send(self, text, attachments=None, regenerate=False):
         attachments = attachments or []
-        budget = int(self.client.context_window() * self.settings.context_budget)
+        budget = self.context_budget_tokens()
         dropped = self.conversation.trim(budget)
         if dropped:
-            self.renderer.notice(f'trimmed {dropped} oldest messages to fit the context budget')
+            self.renderer.notice(f'trimmed {dropped} oldest message(s) to fit the '
+                                 f'{budget}-token context budget (/compact keeps a summary '
+                                 'instead)')
+        problems = self.conversation.validate_wire()
+        if problems:
+            self.renderer.notice('history repaired before sending: ' + '; '.join(problems[:3]))
+            self.conversation._repair_orphans()
+        self._cancelled = False
         try:
             result = self.agent.run(self.conversation, text=text, attachments=attachments,
                                     regenerate=regenerate)
         except BonsaiError as e:
             self.renderer.finish()
-            self.say(self.style.red('✗ ' + str(e)))
+            self.renderer.error(str(e))
             hint = e.hint() if isinstance(e, BonsaiAPIError) else ''
             if hint:
                 self.say(self.style.dim('  hint: ' + hint))
             return None
         self.renderer.finish()
+        result.stats.context_used = self.conversation.tokens()
+        result.stats.context_window = self.client.context_window()
+        self.last_stats = result.stats
         self.totals['turns'] += 1
         self.totals['prompt_tokens'] += result.prompt_tokens
         self.totals['completion_tokens'] += result.completion_tokens
+        self.totals['reasoning_tokens'] += result.stats.reasoning_tokens or 0
         self.totals['tool_calls'] += len(result.tool_calls)
         self.totals['seconds'] += result.elapsed or 0.0
-        self.say(self.style.dim(
-            f'{result.completion_tokens} tok out / {result.prompt_tokens} in'
-            + (f' | {result.rate():.1f} tok/s' if result.rate() else '')
-            + (f' | ttft {result.ttft * 1000:.0f} ms' if result.ttft else '')
-            + (f' | {len(result.tool_calls)} tool call(s)' if result.tool_calls else '')
-            + f' | {result.elapsed:.1f}s' + (' | cancelled' if result.cancelled else '')))
+        if result.cancelled:
+            self.totals['cancels'] += 1
+        if result.stats.ttft:
+            self.totals['ttfts'].append(result.stats.ttft)
+        if result.stats.tokens_per_s:
+            self.totals['rates'].append(result.stats.tokens_per_s)
+        if self.settings.show_stats:
+            self.say(format_stats_block(result.stats, self.style))
+        else:
+            self.say(self.style.dim(format_stats(result.stats, self.style)))
         self.say()
-        if self.session_path:
+        self._autosave_counter += 1
+        if self.session_path and self._autosave_counter >= max(1, self.settings.autosave_every):
+            self._autosave_counter = 0
             try:
                 self.conversation.save(self.session_path)
             except OSError as e:
@@ -2190,8 +3699,41 @@ class ChatApp:
                 self.settings.max_tokens = int(arg)
                 self.say(s.dim(f'max_tokens {self.settings.max_tokens}'))
             elif cmd == 'effort':
-                self.settings.effort = (arg or 'medium').lower()
-                self.say(s.dim(f'reasoning effort {self.settings.effort}'))
+                if not arg:
+                    self.say(s.dim('reasoning_effort: ' + str(self.settings.reasoning.effort)
+                                   + ' — Bonsai 2 accepts medium|xhigh (low is a documented '
+                                     'no-op and is not offered)'))
+                else:
+                    self.settings.effort = arg
+                    self.say(s.dim(f'reasoning_effort {self.settings.reasoning.effort} '
+                                   f'({self.settings.reasoning.describe()})'))
+            elif cmd in ('think', 'thinking', 'budget'):
+                self._think_command(arg)
+            elif cmd == 'reasoning':
+                self._reasoning_display_command(arg)
+            elif cmd == 'stats':
+                self._stats_command()
+            elif cmd == 'speed':
+                self.settings.show_stats = not self.settings.show_stats if arg == '' else \
+                    arg.lower() in ('on', '1', 'true', 'yes', 'full')
+                self.say(s.dim('per-turn timing table ' +
+                               ('on' if self.settings.show_stats else 'off') +
+                               ' (one-line summary otherwise)'))
+            elif cmd == 'compact':
+                self._compact_command(arg)
+            elif cmd == 'cancel':
+                self.pending_images = []
+                self.renderer.finish()
+                self.say(s.dim('cleared the queued turn. Ctrl-C interrupts a generation that '
+                               'is already running; the partial answer is discarded and the '
+                               'history is left untouched.'))
+            elif cmd == 'doctor':
+                run_doctor(self.client, style=self.style, out=self.out,
+                           as_json=arg.strip() == '--json')
+            elif cmd in ('caps', 'capabilities'):
+                self._caps_command()
+            elif cmd == 'bench':
+                self._bench_command(arg)
             elif cmd == 'stream':
                 self.settings.stream = arg.lower() in ('on', '1', 'true', 'yes')
                 self.say(s.dim('streaming ' + ('on' if self.settings.stream else 'off')))
@@ -2211,10 +3753,17 @@ class ChatApp:
                 else:
                     self.say(s.dim('vision: ' + str(self.client.probe_vision())))
             elif cmd == 'context':
-                self.say(s.dim(f'context window {self.client.context_window()} | '
-                               f'history {self.conversation.tokens()} tokens over '
-                               f'{len(self.conversation.messages)} messages | '
-                               f'budget {int(self.client.context_window() * self.settings.context_budget)}'))
+                window = self.client.context_window()
+                used = self.conversation.tokens()
+                budget = self.context_budget_tokens()
+                self.say(s.dim(f'context window {window} | history {used} tokens over '
+                               f'{len(self.conversation.messages)} messages '
+                               f'({100.0 * used / window:.0f}% of window) | '
+                               f'budget {budget} (reserve '
+                               f'{self.settings.context_reserve}+'
+                               f'{min(self.settings.max_tokens, self.settings.output_reserve)} '
+                               f'for template + answer) | tokenizer '
+                               f'{"server /tokenize" if self.conversation.counter.using_server() else "estimate"}'))
             elif cmd == 'history':
                 for m in self.conversation.messages:
                     body = m.get('content')
@@ -2225,8 +3774,10 @@ class ChatApp:
             elif cmd == 'usage':
                 t = self.totals
                 self.say(s.dim(f'{t["turns"]} turn(s) | {t["completion_tokens"]} tokens out, '
-                               f'{t["prompt_tokens"]} in | {t["tool_calls"]} tool call(s) | '
-                               f'{t["seconds"]:.1f}s of model time'))
+                               f'{t["prompt_tokens"]} in, {t["reasoning_tokens"]} reasoning | '
+                               f'{t["tool_calls"]} tool call(s) | '
+                               f'{t["seconds"]:.1f}s of model time | '
+                               f'{t["cancels"]} cancelled, {t["compactions"]} compacted'))
             elif cmd == 'save':
                 path = self.conversation.save(arg or self.session_path or 'bonsai-session.jsonl')
                 self.say(s.dim('saved ' + str(path)))
@@ -2248,6 +3799,108 @@ class ChatApp:
         except (ValueError, BonsaiError, OSError, json.JSONDecodeError) as e:
             self.say(s.red(f'{cmd} failed: {e}'))
         return True
+
+    # ------------------------------------------------------------------
+    def _think_command(self, arg):
+        """Change the thinking budget without touching history or restarting anything."""
+        s = self.style
+        if not arg:
+            budgets = '  '.join(f'{k}={v if v != -1 else "unlimited"}'
+                                for k, v in THINK_BUDGETS.items())
+            self.say(s.dim(f'thinking: {self.settings.reasoning.label()} | levels: {budgets}'))
+            self.say(s.dim('usage: /think off|low|medium|high|max  or  /think <tokens>'))
+            return
+        try:
+            self.settings.think = arg
+        except ValueError as e:
+            self.say(s.red(str(e)))
+            return
+        supported = self.client.caps.supported('thinking_budget_tokens')
+        note = ''
+        if supported is False:
+            note = ' — but this build rejects thinking_budget_tokens, so thinking stays server-controlled'
+        elif supported is None:
+            note = ' — will be confirmed on the next request'
+        self.say(s.dim(f'thinking {self.settings.reasoning.label()}{note}'))
+
+    def _reasoning_display_command(self, arg):
+        s = self.style
+        if arg.lower() not in REASONING_DISPLAYS:
+            self.say(s.dim('usage: /reasoning full|compact|hidden  (current: '
+                           + self.settings.reasoning.display + ')'))
+            return
+        self.settings.reasoning.display = arg.lower()
+        self.renderer.reasoning_display = arg.lower()
+        self.say(s.dim('reasoning display: ' + arg.lower() +
+                       (' — the trace is streamed' if arg == 'full' else
+                        ' — one indicator + a token count' if arg == 'compact' else
+                        ' — never shown, only counted')))
+
+    def _stats_command(self):
+        s = self.style
+        t = self.totals
+        self.say(s.bold('session'))
+        self.say(s.dim(f'  {t["turns"]} turn(s), {t["seconds"]:.1f}s of model time, '
+                       f'{t["cancels"]} cancelled'))
+        self.say(s.dim(f'  {t["completion_tokens"]} completion tokens, {t["prompt_tokens"]} '
+                       f'prompt tokens, {t["reasoning_tokens"]} reasoning tokens, '
+                       f'{t["tool_calls"]} tool call(s), {t["compactions"]} compaction(s)'))
+        if t['ttfts']:
+            self.say(s.dim(f'  ttft      median {statistics.median(t["ttfts"]) * 1000:.0f} ms | '
+                           f'min {min(t["ttfts"]) * 1000:.0f} | max {max(t["ttfts"]) * 1000:.0f} '
+                           f'({len(t["ttfts"])} sample(s))'))
+        if t['rates']:
+            self.say(s.dim(f'  decode    median {statistics.median(t["rates"]):.1f} tok/s | '
+                           f'min {min(t["rates"]):.1f} | max {max(t["rates"]):.1f}'))
+        tr = self.client.transport.stats()
+        self.say(s.dim(f'  transport {tr["requests"]} requests over '
+                       f'{tr["connections_opened"]} connection(s), '
+                       f'{tr["reconnects"]} reconnect(s), pooled={tr["pooled"]}'))
+        if self.last_stats:
+            self.say(s.bold('last turn'))
+            self.say(format_stats_block(self.last_stats, s))
+
+    def _caps_command(self):
+        s = self.style
+        caps = self.client.caps
+        self.say(s.bold('server capabilities (learned from this endpoint, not assumed)'))
+        for name in sorted(caps.fields):
+            state = caps.state(name)
+            colour = {'supported': s.green, 'unsupported': s.red}.get(state, s.yellow)
+            detail = caps.evidence.get(name, '')
+            self.say(f'  {colour(state.ljust(11))} {name}' + (s.dim('  — ' + detail) if detail else ''))
+        for k in ('vision', 'context_window', 'served_models', 'version'):
+            if k in caps.facts:
+                self.say(s.dim(f'  {k}: {caps.facts[k]}'))
+
+    def _compact_command(self, arg):
+        s = self.style
+        budget = self.context_budget_tokens()
+        keep = 2
+        if arg.isdigit():
+            keep = max(0, int(arg))
+        before = len(self.conversation.messages)
+        report = self.conversation.compact(budget, keep_recent=keep)
+        self.totals['compactions'] += 1
+        self.say(s.dim(f'compacted {report["compacted"]} message(s) into a summary, kept the '
+                       f'last {report["kept"]} turn(s): {report["tokens_before"]} -> '
+                       f'{report["tokens_after"]} tokens '
+                       f'({len(self.conversation.messages)} messages, was {before})'))
+        if report.get('trimmed'):
+            self.say(s.dim(f'still over budget afterwards — also trimmed '
+                           f'{report["trimmed"]} message(s)'))
+
+    def _bench_command(self, arg):
+        """Measure this endpoint for real: TTFT, prefill and decode over N samples."""
+        samples = 3
+        bits = arg.split()
+        if bits and bits[0].isdigit():
+            samples = max(1, min(10, int(bits[0])))
+        self.say(self.style.dim(f'benchmarking {samples} sample(s) against '
+                                f'{self.client.base_url} (the prompt is fixed on purpose, '
+                                'so the second and later samples measure prompt-cache reuse)'))
+        report = run_benchmark(self.client, samples=samples, style=self.style, out=self.out)
+        self.say(render_benchmark(report, self.style))
 
     def _tools_command(self, arg):
         s = self.style
@@ -2316,6 +3969,171 @@ class ChatApp:
 
 
 # ======================================================================
+# Benchmarking — measured numbers only
+# ======================================================================
+def sig(value, digits=3):
+    """Round to `digits` significant figures.
+
+    A decode rate measured from three samples is not known to six decimal places; printing
+    147.123456 tok/s would be a lie about the precision of the measurement.
+    """
+    if value is None:
+        return None
+    if value == 0:
+        return 0.0
+    from math import floor, log10
+    magnitude = floor(log10(abs(value)))
+    return round(value, -int(magnitude) + (digits - 1))
+
+
+def summarize(values):
+    """median / min / max / p95 over real samples. Empty in, empty out — no invention."""
+    clean = [v for v in values if v is not None]
+    if not clean:
+        return {'n': 0, 'median': None, 'min': None, 'max': None, 'p95': None}
+    clean = sorted(clean)
+    n = len(clean)
+
+    def pct(p):
+        if n == 1:
+            return clean[0]
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return clean[idx]
+
+    return {'n': n, 'median': statistics.median(clean), 'min': clean[0], 'max': clean[-1],
+            'p95': pct(0.95)}
+
+
+BENCH_PROMPT_BLOCKS = 40
+
+
+def run_benchmark(client, samples=3, style=None, out=None, max_tokens=96, warmup=1,
+                  progress=None):
+    """Measure TTFT, prefill speed, decode speed and total latency against a live endpoint.
+
+    Every number comes from the server's own usage/timings block, or from a monotonic
+    clock around a real request. Nothing is estimated, and a field the server did not
+    report stays None so the renderer prints `n/a` instead of a guess.
+
+    Sample 1 is the cold start (nothing in the prompt cache). The next `warmup` samples
+    are discarded, and the rest are the warm distribution — reported as median/min/max/p95.
+    """
+    out = out if out is not None else sys.stdout
+    prompt = ('Review this Python function and give two concrete improvements.\\n\\n' +
+              ('def search(items, target):\\n'
+               '    for index, value in enumerate(items):\\n'
+               '        if value == target:\\n'
+               '            return index\\n'
+               '    return -1\\n\\n') * BENCH_PROMPT_BLOCKS)
+    messages = [{'role': 'user', 'content': prompt}]
+    report = {'endpoint': client.base_url, 'model': client.model, 'samples': samples,
+              'warmup': warmup, 'max_tokens': max_tokens, 'cold': None, 'warm': {},
+              'errors': [], 'notes': []}
+    collected = {'ttft': [], 'prefill': [], 'decode': [], 'latency': [],
+                 'prompt_tokens': [], 'completion_tokens': []}
+    # i==0 is the cold start (empty prompt cache), then `warmup` discarded samples, then
+    # the `samples` that actually form the reported distribution.
+    total = samples + warmup + 1
+    for i in range(total):
+        label = 'cold' if i == 0 else ('warmup' if i <= warmup else f'sample {i - warmup}')
+        if progress:
+            progress(label, i + 1, total)
+        started = time.monotonic()
+        stats = TurnStats()
+        try:
+            with client.stream_chat(messages, max_tokens=max_tokens, temperature=1.0) as stream:
+                for ev in stream:
+                    if ev['kind'] == 'done':
+                        stats.absorb(ev.get('usage'), ev.get('timings'),
+                                     ttft=ev.get('ttft'), elapsed=ev.get('elapsed') or 0.0)
+        except BonsaiError as e:
+            report['errors'].append(f'{label}: {e}')
+            continue
+        stats.elapsed = time.monotonic() - started
+        entry = {'ttft_s': stats.ttft, 'latency_s': stats.elapsed,
+                 'prefill_tok_s': stats.prompt_tokens_per_s, 'decode_tok_s': stats.tokens_per_s,
+                 'prompt_tokens': stats.prompt_tokens,
+                 'completion_tokens': stats.completion_tokens}
+        if i == 0:
+            report['cold'] = entry
+            continue
+        if i <= warmup:
+            continue
+        for key, value in (('ttft', stats.ttft), ('prefill', stats.prompt_tokens_per_s),
+                           ('decode', stats.tokens_per_s), ('latency', stats.elapsed),
+                           ('prompt_tokens', stats.prompt_tokens),
+                           ('completion_tokens', stats.completion_tokens)):
+            if value is not None:
+                collected[key].append(value)
+    report['warm'] = {k: summarize(v) for k, v in collected.items()}
+    if not collected['decode']:
+        report['notes'].append('no decode rate was measured — the server did not report '
+                               'timings and no completion tokens arrived')
+    facts = client.caps.facts
+    report['context_window'] = facts.get('context_window')
+    report['runtime'] = facts.get('version')
+    report['transport'] = client.transport.stats()
+    return report
+
+
+def render_benchmark(report, style=None):
+    """Human-readable benchmark output. Unmeasured fields are printed as `n/a`."""
+    style = style or Style(force_color=False)
+    lines = [style.bold('benchmark — measured against ' + report['endpoint'])]
+    if report.get('runtime'):
+        lines.append(style.dim(f'runtime: {report["runtime"]}'))
+    if report.get('context_window'):
+        lines.append(style.dim(f'context window: {report["context_window"]} tokens'))
+
+    def row(name, summary, unit, digits=3, scale=1.0):
+        if not summary or not summary.get('n'):
+            return f'  {name:<22} n/a  (not measured)'
+        return (f'  {name:<22} median {sig(summary["median"] * scale, digits)} {unit}'
+                f'  |  min {sig(summary["min"] * scale, digits)}'
+                f'  |  max {sig(summary["max"] * scale, digits)}'
+                f'  |  p95 {sig(summary["p95"] * scale, digits)}'
+                f'  |  n={summary["n"]}')
+
+    cold = report.get('cold') or {}
+    if cold:
+        parts = []
+        if cold.get('ttft_s'):
+            parts.append(f'ttft {sig(cold["ttft_s"] * 1000)} ms')
+        if cold.get('prefill_tok_s'):
+            parts.append(f'prefill {sig(cold["prefill_tok_s"])} tok/s')
+        if cold.get('decode_tok_s'):
+            parts.append(f'decode {sig(cold["decode_tok_s"])} tok/s')
+        if cold.get('latency_s'):
+            parts.append(f'total {sig(cold["latency_s"])} s')
+        lines.append(style.dim('  cold start (first request, empty prompt cache): ' +
+                               (' | '.join(parts) if parts else 'n/a')))
+    warm = report.get('warm') or {}
+    lines.append(style.dim(f'  warm ({warm.get("decode", {}).get("n", 0)} sample(s), '
+                           f'{report.get("warmup", 0)} warmup discarded):'))
+    lines.append(row('ttft', warm.get('ttft'), 'ms', scale=1000.0))
+    lines.append(row('prefill speed', warm.get('prefill'), 'tok/s'))
+    lines.append(row('decode speed', warm.get('decode'), 'tok/s'))
+    lines.append(row('total latency', warm.get('latency'), 's'))
+    pt = warm.get('prompt_tokens') or {}
+    ct = warm.get('completion_tokens') or {}
+    if pt.get('n'):
+        lines.append(style.dim(f'  prompt {sig(pt["median"])} tok, '
+                               f'completion {sig(ct.get("median"))} tok per sample'))
+    tr = report.get('transport') or {}
+    if tr:
+        lines.append(style.dim(f'  transport: {tr.get("requests", 0)} requests, '
+                               f'{tr.get("connections_opened", 0)} connection(s), '
+                               f'{tr.get("reconnects", 0)} reconnect(s)'))
+    for note in report.get('notes', []):
+        lines.append(style.yellow('  note: ' + note))
+    for err in report.get('errors', []):
+        lines.append(style.red('  error: ' + str(err)[:200]))
+    lines.append(style.dim('  VRAM/RAM are server-side and cannot be measured from the '
+                           'client — the deployment cell reports those.'))
+    return '\n'.join(lines)
+
+
+# ======================================================================
 # CLI
 # ======================================================================
 def build_parser():
@@ -2342,14 +4160,38 @@ def build_parser():
     p.add_argument('--temperature', type=float, default=1.0)
     p.add_argument('--top-p', type=float, default=0.95)
     p.add_argument('--max-tokens', type=int, default=2048)
-    p.add_argument('--effort', default='medium', choices=['none', 'low', 'medium', 'high'],
-                   help='reasoning effort sent as reasoning_effort')
+    p.add_argument('--effort', default='medium',
+                   help='reasoning_effort sent to the chat template: medium|xhigh '
+                        '(Bonsai 2 documents `low` as a no-op, so it is not offered; '
+                        '`none` turns thinking off)')
+    p.add_argument('--think', default='medium',
+                   help='thinking budget: off|low|medium|high|max (=0/512/2048/8192/unlimited '
+                        'thinking_budget_tokens) or an explicit token count')
+    p.add_argument('--reasoning-display', default='compact', choices=list(REASONING_DISPLAYS),
+                   help='full: stream the thinking trace; compact: one indicator + a token '
+                        'count; hidden: count it only')
     p.add_argument('--no-stream', action='store_true', help='request one complete answer')
     p.add_argument('--no-markdown', action='store_true', help='print model output verbatim')
     p.add_argument('--no-highlight', action='store_true', help='no Pygments highlighting in code blocks')
     p.add_argument('--no-tools', action='store_true', help='disable tool calling')
     p.add_argument('--tools', help='comma-separated tool names to enable (default: all)')
     p.add_argument('--max-tool-rounds', type=int, default=6)
+    p.add_argument('--tool-timeout', type=float, default=60.0,
+                   help='seconds before an individual tool call is abandoned')
+    p.add_argument('--tool-budget', type=float, default=600.0,
+                   help='total seconds the tool loop may take in one turn')
+    p.add_argument('--tool-max-output', type=int, default=24000,
+                   help='characters of tool output fed back to the model per call')
+    p.add_argument('--autosave-every', type=int, default=1,
+                   help='write the session file every N turns (default every turn)')
+    p.add_argument('--context-reserve', type=int, default=512,
+                   help='tokens held back for the chat template')
+    p.add_argument('--output-reserve', type=int, default=1024,
+                   help='tokens held back for the answer being generated')
+    p.add_argument('--show-stats', action='store_true',
+                   help='print the full timing table after every turn (same as /speed on)')
+    p.add_argument('--no-keepalive', action='store_true',
+                   help='open a fresh connection per request (debugging only; slower)')
     p.add_argument('--sandbox', default=None, help='directory tools may touch (default: cwd)')
     p.add_argument('--auto-approve', action='store_true',
                    help='let the model write files and run commands without asking')
@@ -2367,6 +4209,12 @@ def build_parser():
     p.add_argument('--doctor', action='store_true',
                    help='diagnose a real endpoint (health, models, context, auth, chat, '
                         'streaming, tool calling, vision) and exit')
+    p.add_argument('--benchmark', action='store_true',
+                   help='measure TTFT, prefill and decode speed against the endpoint and exit')
+    p.add_argument('--bench-samples', type=int, default=3,
+                   help='benchmark samples after warmup (default 3)')
+    p.add_argument('--bench-warmup', type=int, default=1,
+                   help='benchmark warmup samples to discard (default 1)')
     p.add_argument('--mock', action='store_true',
                    help='run against the bundled protocol stub (scripted replies, no model, '
                         'no GPU) to try the client without a deployment')
@@ -2512,33 +4360,54 @@ def run_selftest(style=None, out=None):
     return 0 if passed == len(results) else 1
 
 
-def run_doctor(client, style=None, out=None):
-    """Live diagnostics against a real deployment: is this endpoint actually usable?"""
+#: doctor states. `PASS` is only ever printed for behaviour that was actually exercised.
+DOCTOR_STATES = ('PASS', 'FAIL', 'SKIP', 'UNKNOWN', 'DEGRADED')
+
+
+def run_doctor(client, style=None, out=None, as_json=False):
+    """Live diagnostics against a real deployment: is this endpoint actually usable?
+
+    With `as_json` the same checks are emitted as one machine-readable object instead of
+    the human table, so a deployment can be monitored without scraping text.
+    """
     style = style or Style(force_color=False)
     out = out if out is not None else sys.stdout
     results = []
+    report = {'endpoint': client.base_url, 'model': client.model,
+              'client_version': VERSION, 'checks': {}}
 
     def check(name, state, detail=''):
+        if state not in DOCTOR_STATES:
+            raise ValueError(f'unknown doctor state {state!r}')
         results.append(state)
+        report['checks'][name] = {'state': state, 'detail': detail}
+        if as_json:
+            return
         mark = {'PASS': style.green('PASS'), 'FAIL': style.red('FAIL'),
-                'SKIP': style.yellow('SKIP')}[state]
+                'SKIP': style.yellow('SKIP'), 'UNKNOWN': style.yellow('UNKNOWN'),
+                'DEGRADED': style.yellow('DEGRADED')}[state]
         out.write(f'{mark}  {name}' + (style.dim(' — ' + detail) if detail else '') + '\n')
         out.flush()
 
-    out.write(style.bold(f'Diagnosing {client.base_url} '
-                         f'(key {mask_key(client.api_key)}, model {client.model})\n\n'))
+    def say(text):
+        if not as_json:
+            out.write(text + '\n')
+            out.flush()
+
+    say(style.bold(f'Diagnosing {client.base_url} '
+                   f'(key {mask_key(client.api_key)}, model {client.model}, '
+                   f'client v{VERSION})\n'))
 
     try:
         health = client.get_json('/health', timeout=15, root=True)
         check('/health', 'PASS' if isinstance(health, dict) else 'FAIL', json.dumps(health)[:80])
     except BonsaiError as e:
         check('/health', 'FAIL', str(e))
-        out.write(style.red('\nThe endpoint is not reachable — nothing else can be tested. '
-                            'If this was a Colab/Kaggle deployment, the runtime (and its '
-                            'Quick Tunnel URL) is gone: rerun colab_kaggle_cell.py and use the '
-                            'new base URL and key.\n'))
-        out.flush()
-        return 1
+        say(style.red('\nThe endpoint is not reachable — nothing else can be tested. '
+                      'If this was a Colab/Kaggle deployment, the runtime (and its '
+                      'Quick Tunnel URL) is gone: rerun colab_kaggle_cell.py and use the '
+                      'new base URL and key.'))
+        return _doctor_exit(report, results, style, out, as_json, client)
 
     try:
         ids = client.model_ids()
@@ -2628,13 +4497,64 @@ def run_doctor(client, style=None, out=None):
           'pixels can be sent' if vision else
           'text-only build — the client sends measured image facts instead')
 
-    passed = results.count('PASS')
-    failed = results.count('FAIL')
-    out.write(f'\n{passed} passed, {failed} failed, {results.count("SKIP")} skipped\n')
-    out.write(style.green('Endpoint is usable.' if not failed else
-                          'Endpoint has failures — see above.') + '\n')
+    # ---- reasoning controls: probe what the runtime actually accepts -------------
+    for field_name, value, label in (('thinking_budget_tokens', 2048, 'thinking budget'),
+                                     ('reasoning_effort', 'medium', 'reasoning_effort')):
+        try:
+            ok = client.probe_field(field_name, value)
+        except BonsaiError as e:
+            check(f'reasoning control: {label}', 'UNKNOWN', f'probe failed: {e}')
+            continue
+        check(f'reasoning control: {label}', 'PASS' if ok else 'DEGRADED',
+              'accepted by this build' if ok else
+              'rejected with HTTP 400 — thinking stays server-controlled')
+
+    _report_capabilities(client, style, out, as_json, report, check)
+    return _doctor_exit(report, results, style, out, as_json, client)
+
+
+def _report_capabilities(client, style, out, as_json, report, check=None):
+    """Print the capability map: supported / unsupported / unknown, with evidence."""
+    caps = client.caps
+    report['capabilities'] = caps.to_dict()
+    report['transport'] = client.transport.stats()
+    if as_json:
+        return
+    out.write('\n' + style.bold('capability map (learned from this endpoint)\n'))
+    for name in sorted(caps.fields):
+        state = caps.state(name)
+        colour = {'supported': style.green, 'unsupported': style.red}.get(state, style.yellow)
+        detail = caps.evidence.get(name, 'not tested against this build')
+        out.write(f'  {colour(state.ljust(11))} {name}' + style.dim('  — ' + detail) + '\n')
+    for key in ('vision', 'vision_source', 'context_window', 'served_models', 'model_path',
+                'total_slots', 'version'):
+        if key in caps.facts:
+            out.write(style.dim(f'  {key}: {caps.facts[key]}') + '\n')
+    tr = client.transport.stats()
+    out.write(style.dim(f'  transport: {tr["requests"]} requests, '
+                        f'{tr["connections_opened"]} connection(s), '
+                        f'{tr["reconnects"]} reconnect(s), keep-alive pooled={tr["pooled"]}'
+                        ) + '\n')
     out.flush()
-    return 0 if not failed else 1
+
+
+def _doctor_exit(report, results, style, out, as_json, client=None):
+    counts = {state: results.count(state) for state in DOCTOR_STATES}
+    report['summary'] = counts
+    report['usable'] = counts['FAIL'] == 0
+    if as_json:
+        out.write(json.dumps(report, ensure_ascii=False, indent=2, default=str) + '\n')
+        out.flush()
+    else:
+        out.write(f'\n{counts["PASS"]} passed, {counts["FAIL"]} failed, '
+                  f'{counts["SKIP"]} skipped, {counts["UNKNOWN"]} unknown, '
+                  f'{counts["DEGRADED"]} degraded\n')
+        out.write(style.green('Endpoint is usable.' if counts['FAIL'] == 0 else
+                              'Endpoint has failures — see above.') + '\n')
+        out.flush()
+    if client is not None:
+        client.close()
+    return 0 if counts['FAIL'] == 0 else 1
 
 
 def make_app(client, settings, style, registry=None, conversation=None, sandbox=None,
@@ -2686,23 +4606,64 @@ def main(argv=None):
     elif args.system_file:
         system = Path(args.system_file).expanduser().read_text(encoding='utf-8')
 
+    try:
+        reasoning = ReasoningConfig(level=args.think,
+                                    effort=None if str(args.effort).lower() in ('none', 'off')
+                                    else args.effort,
+                                    display=args.reasoning_display)
+    except ValueError as e:
+        sys.stderr.write(f'error: {e}\n')
+        return 2
+    if str(args.effort).lower() in ('none', 'off'):
+        reasoning.level = 'off'
+        reasoning.effort = None
     settings = Settings(model=args.model, temperature=args.temperature, top_p=args.top_p,
-                        max_tokens=args.max_tokens, effort=args.effort,
+                        max_tokens=args.max_tokens, reasoning=reasoning,
                         stream=not args.no_stream, use_tools=not args.no_tools,
                         markdown=not args.no_markdown, highlight=not args.no_highlight,
-                        max_tool_rounds=args.max_tool_rounds)
+                        max_tool_rounds=args.max_tool_rounds,
+                        tool_timeout=args.tool_timeout, tool_budget=args.tool_budget,
+                        tool_max_output=args.tool_max_output,
+                        autosave_every=args.autosave_every,
+                        context_reserve=args.context_reserve,
+                        output_reserve=args.output_reserve,
+                        show_stats=args.show_stats)
 
     client = BonsaiClient(args.base_url, args.api_key, model=args.model,
-                          timeout=args.timeout, retries=args.retries)
+                          timeout=args.timeout, retries=args.retries,
+                          keepalive=not args.no_keepalive)
     if args.doctor:
-        return run_doctor(client, style=style)
+        try:
+            return run_doctor(client, style=style, as_json=args.json)
+        finally:
+            client.close()
+    if args.benchmark:
+        def progress(label, i, total):
+            sys.stderr.write(f'  {label} ({i}/{total})\n')
+        report = run_benchmark(client, samples=max(1, args.bench_samples),
+                               warmup=max(0, args.bench_warmup), style=style,
+                               progress=progress)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(render_benchmark(report, style))
+        client.close()
+        return 1 if report.get('errors') and not report['warm'].get('decode', {}).get('n') else 0
     if args.context:
         client.context_window = (lambda override=args.context: override)
 
     counter = TokenCounter(client)
     resumed = bool(args.session) and Path(args.session).expanduser().is_file()
     if resumed:
-        conversation = Conversation.load(args.session, counter=counter)
+        conversation = Conversation.load(
+            args.session, counter=counter,
+            on_error=lambda n: sys.stderr.write(
+                f'warning: skipped {n} unreadable line(s) in {args.session}; the rest of the '
+                'session was loaded\n'))
+        if conversation.skipped_lines:
+            sys.stderr.write(f'note: session file came from '
+                             f'{conversation.saved_version or "an older version"} '
+                             f'(schema {conversation.schema})\n')
         if explicit_system:
             conversation.set_system(system or '')
     else:
@@ -2743,7 +4704,11 @@ def main(argv=None):
         app.show_cards(attachments)
 
     if args.json:
-        app.renderer = LiveRenderer(style, markdown=False, out=io.StringIO())
+        # Machine-readable mode: stdout carries exactly one JSON document. Everything
+        # human-readable — the streamed answer, the stats line, notices — goes to a sink.
+        sink = io.StringIO()
+        app.out = sink
+        app.renderer = LiveRenderer(style, markdown=False, out=sink)
         app.agent = Agent(client, settings, registry=registry, counter=counter,
                           on_delta=lambda t: None, on_reasoning=lambda t: None,
                           on_tool=lambda *a: None, on_notice=lambda t: None)
@@ -2754,13 +4719,19 @@ def main(argv=None):
             if result is None:
                 return 1
             if args.json:
-                print(json.dumps({'model': client.model, 'text': result.text,
-                                  'reasoning': result.reasoning,
+                print(json.dumps({'model': client.model, 'version': VERSION,
+                                  'text': result.text, 'reasoning': result.reasoning,
                                   'tool_calls': result.tool_calls,
                                   'finish_reason': result.finish_reason,
                                   'usage': result.usage, 'timings': result.timings,
+                                  'stats': result.stats.to_dict(),
+                                  'reasoning_config': settings.reasoning.to_dict(),
+                                  'capabilities': client.caps.to_dict(),
                                   'elapsed': result.elapsed, 'ttft': result.ttft,
-                                  'rounds': result.rounds}, ensure_ascii=False, indent=2))
+                                  'rounds': result.rounds,
+                                  'cancelled': result.cancelled,
+                                  'interrupted': result.interrupted or None},
+                                 ensure_ascii=False, indent=2))
             return 0
         return app.run()
     except KeyboardInterrupt:

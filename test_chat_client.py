@@ -482,7 +482,15 @@ class ConversationTests(ServerTestCase):
         conv.add_user('hello')
         conv.add_assistant({'role': 'assistant', 'content': 'hi there'})
         path = conv.save(self.root / 's.jsonl')
-        self.assertEqual(path.read_text().count('\n'), 3)
+        # v0.5.0 session files carry one extra leading `_meta` line (schema + version) so a
+        # future client can tell an old file from a corrupt one. The guarantee that matters
+        # is unchanged: one JSON object per line, and every message survives a round trip.
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 4)
+        meta = json.loads(lines[0])
+        self.assertTrue(meta['_meta'])
+        self.assertEqual(meta['schema'], bc.SESSION_SCHEMA)
+        self.assertEqual(meta['version'], bc.VERSION)
         loaded = bc.Conversation.load(path)
         self.assertEqual([m['role'] for m in loaded.messages], ['system', 'user', 'assistant'])
         md = conv.export_markdown(self.root / 's.md')
@@ -537,7 +545,12 @@ class ReplTests(ServerTestCase):
         self.assertEqual(self.settings.temperature, 0.3)
         self.assertEqual(self.settings.top_p, 0.8)
         self.assertEqual(self.settings.max_tokens, 128)
-        self.assertEqual(self.settings.effort, 'high')
+        # v0.5.0: reasoning_effort is mapped onto what the Bonsai 2 chat template actually
+        # accepts (medium | xhigh). 'high' is accepted as an alias and normalised to 'xhigh'
+        # rather than being sent verbatim and silently ignored by the model. The guarantee
+        # this test holds — /effort changes the effort sent on the next request — is intact.
+        self.assertEqual(self.settings.effort, 'xhigh')
+        self.assertIn('reasoning_effort', self.settings.api_params())
         self.assertFalse(self.settings.stream)
         self.assertFalse(self.settings.markdown)
         self.assertEqual(self.client.model, 'other-model')
