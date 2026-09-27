@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import urllib.request
 
 from ._meta import VERSION
 from .client import BonsaiClient
@@ -14,11 +15,15 @@ from .tokens import TokenCounter
 
 DOCTOR_STATES = ('PASS', 'FAIL', 'SKIP', 'UNKNOWN', 'DEGRADED')
 
-def run_doctor(client, style=None, out=None, as_json=False):
+def run_doctor(client, style=None, out=None, as_json=False, serve_url=None):
     """Live diagnostics against a real deployment: is this endpoint actually usable?
 
     With `as_json` the same checks are emitted as one machine-readable object instead of
     the human table, so a deployment can be monitored without scraping text.
+
+    `serve_url` (normally from ``BONSAI_SERVE_URL``) adds one check for a local
+    ``--serve`` instance. When it is None the check does not exist at all: the web
+    server stays out of the doctor's default checks unless it is running.
     """
     style = style or Style(force_color=False)
     out = out if out is not None else sys.stdout
@@ -172,6 +177,18 @@ def run_doctor(client, style=None, out=None, as_json=False):
         check(f'reasoning control: {label}', 'PASS' if ok else 'DEGRADED',
               'accepted by this build' if ok else
               'rejected with HTTP 400 — thinking stays server-controlled')
+
+    # ---- the local web UI: only probed when the user says one is running ---------
+    if serve_url:
+        probe = str(serve_url).rstrip('/') + '/api/version'
+        try:
+            with urllib.request.urlopen(probe, timeout=5) as resp:
+                payload = json.loads(resp.read().decode('utf-8', 'replace'))
+            version = payload.get('version') if isinstance(payload, dict) else None
+            check('local web UI', 'PASS',
+                  f'{serve_url} answering — client v{version or "?"}')
+        except Exception as e:
+            check('local web UI', 'FAIL', f'{probe}: {e}')
 
     _report_capabilities(client, style, out, as_json, report, check)
     return _doctor_exit(report, results, style, out, as_json, client)

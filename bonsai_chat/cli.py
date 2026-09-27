@@ -316,7 +316,16 @@ def main(argv=None):
         return run_selftest(style=style)
     if args.serve:
         from .serve import serve
-        httpd = serve(args.serve_host, args.serve_port, args.base_url, args.api_key, args.model)
+        from .config import SETTING_KEYS, explicit_args
+        explicit = explicit_args(parser, argv or ())
+        cli_layer = {k: v for k, v in explicit.items() if k in SETTING_KEYS}
+        try:
+            httpd = serve(args.serve_host, args.serve_port, args.base_url, args.api_key,
+                          args.model, config_path=args.config, cli_layer=cli_layer,
+                          open_browser=not args.no_browser)
+        except RuntimeError as exc:
+            sys.stderr.write(f'error: {exc}\n')
+            return 1
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -402,7 +411,8 @@ def main(argv=None):
                           keepalive=not args.no_keepalive)
     if args.doctor:
         try:
-            return run_doctor(client, style=style, as_json=args.json)
+            return run_doctor(client, style=style, as_json=args.json,
+                              serve_url=os.environ.get('BONSAI_SERVE_URL'))
         finally:
             client.close()
     if args.benchmark:
