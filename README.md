@@ -331,3 +331,12 @@ This repository's code (the cell and docs) is licensed [Apache-2.0](LICENSE).
 The Ternary Bonsai 2 27B weights are licensed Apache-2.0 by PrismML under their own terms;
 the PrismML runtime binaries are governed by their upstream licenses. Nothing here modifies
 or redistributes model weights.
+
+## Web UI (v0.7.0)
+
+Build the committed browser UI with `cd bonsai_chat/webui && npm install && npm run build`.
+Run it locally with `python3 bonsai_chat.py --serve --base-url https://your-tunnel/v1 --api-key KEY`.
+The Python process is the same-origin proxy: the API key is accepted once by the local
+server and never sent to browser JavaScript, URLs, logs, or API responses. The remote
+model remains the PrismML Ternary Bonsai deployment. Sessions, tools/MCP visibility,
+markdown/export and image input are reserved for v0.7.1.

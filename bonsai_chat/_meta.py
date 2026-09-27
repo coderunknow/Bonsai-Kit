@@ -4,7 +4,7 @@ Kept out of ``__init__.py`` so submodules can read them without importing the
 package (which would be circular).
 """
 
-VERSION = '0.6.0'
+VERSION = '0.7.0'
 DEFAULT_MODEL = 'ternary-bonsai-2-27b'
 
 # How the streaming renderer decides to flush: write immediately when enough text has
