@@ -43,3 +43,18 @@ invalid-key requests are verified to be rejected (401/403) before the URL is ann
 For vulnerabilities in this cell, open an issue or contact the repository maintainer.
 For upstream issues (runtime, kernels, model files), report to
 `PrismML-Eng/Bonsai-demo` / `PrismML-Eng/llama.cpp` / the `prism-ml` model repos.
+
+## v0.5.0 notes
+
+- `diagnostics.json`, written next to the server logs, deliberately excludes the API key:
+  it records model, packing, runtime stamp, context, VRAM/RAM, PIDs, tunnel URL, benchmark
+  and API test results.
+- Session files (`--session`) are written atomically with `fsync` and `chmod 0600`, so a
+  conversation cannot be left world-readable or half-written.
+- Connection reuse never weakens auth: the bearer key is sent on every request, and a
+  pooled connection is dropped whenever a response body is not fully drained.
+- A chat POST is never replayed automatically once its bytes have left the process. That
+  is a correctness guarantee as much as a cost one: a silent retry could produce a second,
+  duplicated generation the user did not ask for.
+- Nothing in the client or the cell kills a process it has not verified by executable
+  path, command line and liveness. Recycled PIDs are rejected, not adopted.
