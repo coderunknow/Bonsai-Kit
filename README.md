@@ -297,8 +297,15 @@ python -m unittest -v test_power_features       # 67 tests: config precedence, b
 python -m unittest -v test_deployment           # 59 tests: the cell's helpers and its
                                                 # module structure, including that the
                                                 # client and cell versions agree
+python -m unittest -v test_web_server           # 40 tests: the local --serve static +
+                                                # /api proxy — SSE order, stop, disconnect,
+                                                # stall, every error kind, key-leak checks,
+                                                # config 0600, traversal
 python3 bonsai_chat.py --selftest               # 31 end-to-end checks against the protocol stub
 python3 bonsai_chat.py --doctor                 # live diagnostics against a real deployment
+cd bonsai_chat/webui && npm test                # 25 front-end tests (vitest + testing-library):
+                                                # SSE parser, useChat stream/stop/retry,
+                                                # capability-gated settings, connect flow
 ```
 
 `test_chat_client` and `test_streaming_recovery` drive the shipped client over real HTTP
@@ -309,7 +316,7 @@ ignores `response_format`, …), so what is executed is the code that ships.
 
 ```bash
 python3 -m unittest discover -s . -p 'test_*.py'
-# 375 tests, all offline, no GPU and no model
+# 415 tests, all offline, no GPU and no model (375 carried over + 40 for --serve)
 ```
 
 **What has not been verified.** The GPU deployment path has never been run against real
@@ -334,9 +341,42 @@ or redistributes model weights.
 
 ## Web UI (v0.7.0)
 
-Build the committed browser UI with `cd bonsai_chat/webui && npm install && npm run build`.
-Run it locally with `python3 bonsai_chat.py --serve --base-url https://your-tunnel/v1 --api-key KEY`.
-The Python process is the same-origin proxy: the API key is accepted once by the local
-server and never sent to browser JavaScript, URLs, logs, or API responses. The remote
-model remains the PrismML Ternary Bonsai deployment. Sessions, tools/MCP visibility,
-markdown/export and image input are reserved for v0.7.1.
+A local browser front end for the same deployment — same capability map, same
+defaults, same client. Vite is a **build-time** tool only: its output is committed, and
+Python serves it as static files. Node is never needed at runtime.
+
+```bash
+cd bonsai_chat/webui && npm install && npm run build   # the two commands (dev/CI only)
+cd ../../.. && python3 bonsai_chat.py --serve \
+    --base-url https://your-tunnel/v1 --api-key KEY    # then open the printed URL
+```
+
+`--serve` starts a **stdlib-only** local server (no Flask/FastAPI; no new Python
+dependency) on `127.0.0.1` (`--serve-host`, `--serve-port 0` = ephemeral, printed;
+`--no-browser` to skip opening a tab). It serves the built UI and proxies `/api/*` to
+the model through `BonsaiClient` — the one transport. The flow it is built for:
+connect (endpoint + key) → health → models → capabilities → streaming chat with a
+Stop button (Esc also works) → retry after a failure.
+
+**The security model in plain words.** Your browser only ever talks to the local
+Python process. The bearer key is posted once to that process and stays in its memory:
+it is never written to `localStorage`/`sessionStorage`, never put in a URL, never
+returned by any `GET`, never logged, and never present in the committed JS bundle. The
+local server binds `127.0.0.1` by default; the tunnel URL and key live server-side,
+same-origin, so there is no CORS surface either.
+
+**Honest, capability-driven settings.** The settings panel is fed by
+`/api/capabilities` (which is the doctor's `supported / unsupported / unknown` map plus
+`/props` facts): a control the running build rejects is *disabled with the evidence as
+the reason*; an untested one stays usable but is labelled `unknown`. The context window
+comes from `/props`, never a hardcoded number. One `--doctor` extra: with
+`BONSAI_SERVE_URL=http://127.0.0.1:<port>` the doctor adds a `local web UI` check —
+without it, the check does not exist.
+
+`python3 evidence/live_session.py` reproduces the whole slice offline: it starts the
+mock endpoint, runs the real `--serve`, and drives a live session (connect → stream →
+stop mid-answer → mid-stream failure → retry) in jsdom.
+
+**Out of scope until v0.7.1** (do not expect them here): session list / save / load /
+branching, tool and MCP visibility, Markdown and code highlighting, export from the UI,
+image input.

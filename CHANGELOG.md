@@ -1,9 +1,68 @@
 # Changelog
 
-## 0.7.0
-- Added the stdlib local web server and same-origin streaming proxy with committed web UI.
-- Added connect/config, health, models, capabilities, chat and stop API routes.
+## v0.7.0 — 2026-09-27
 
+A thin vertical slice: **serve + contract + connect/settings + streaming chat with
+stop**, for a browser front end on the existing Python core. Vite is a dev-time tool
+only — its build output is committed and Python serves it as static files. The model
+lock, runtime lock, stdlib-only runtime, one-cell deployment and offline test policy
+are unchanged; everything here is additive.
+
+### Local server (`bonsai_chat.py --serve`)
+
+- New `bonsai_chat/serve.py`: stdlib `ThreadingHTTPServer` on `127.0.0.1` (flags
+  `--serve`, `--serve-host`, `--serve-port 0` = ephemeral + printed URL,
+  `--no-browser`) that serves the built UI and proxies `/api/*` to the model through
+  `BonsaiClient` — no second transport, no new Python dependency.
+- Routes: `GET /api/health` (measured `latency_ms` or `null`), `/api/models`,
+  `/api/capabilities` (the capability map verbatim, with `/props` facts populated
+  first), `/api/version`, `GET`/`PUT /api/config` (round-trips the same file the CLI
+  uses, 0600, provenance intact, key never echoed), `POST /api/chat` (SSE frames
+  `delta` / `reasoning` / `tool_call` / `usage` / `error` / `done`, flushed per
+  frame), `POST /api/stop` (idempotent, by stream id).
+- Distinct JSON error kinds the UI renders one per class: `connection`, `unauthorized`,
+  `remote`, `mid_stream` (with `tokens_arrived`), `stall` (no bytes for T seconds —
+  watchdog via a reader thread), plus `busy` (concurrent streams are refused, never
+  queued) and `bad_request`.
+- Stop and client disconnect both close the upstream `ChatStream` through a raw-socket
+  shutdown, so a closed tab or a pressed Stop never leaves the remote serving slot
+  busy; a stopped turn keeps its partial answer, marked with a *measured* token count.
+- A missing `webui/dist` prints `run npm install && npm run build …`, never a
+  traceback. The doctor gains one check — `local web UI` — that exists only when
+  `BONSAI_SERVE_URL` points at a running instance; default `--doctor --json` keys are
+  unchanged.
+
+### Front end (`bonsai_chat/webui/`, committed `dist/`)
+
+- React 18 + TypeScript (`strict`) + Vite (`base: './'`), no UI framework, no
+  state library: a `useChat` reducer plus plain components. `dist/` is committed;
+  `node_modules/` is gitignored; the bundle is ~176 KB.
+- Connect bar (endpoint + `type="password"` key posted once, then cleared from the
+  page), health → models → capabilities in order with per-step failures that name the
+  step, capability-driven settings panel (unsupported ⇒ disabled *with the evidence as
+  the reason*, unknown ⇒ labelled), thinking/instruct presets, context window from
+  `/props`.
+- Streaming chat with `fetch` + `ReadableStream` (not `EventSource`), reasoning in a
+  separate collapsible block, Stop (button and Esc) keeping the partial marked
+  `(stopped after N tokens)`, retry that resends the last user message, one failure
+  card per error kind, `aria-live` streaming region, Enter/Shift+Enter, and
+  `prefers-color-scheme` light/dark.
+
+### Tests, docs, versions
+
+- `test_web_server.py`: 40 offline tests (SSE ordering, stop/disconnect/stall, every
+  error kind, traversal, config 0600, and the key never in a response, header, bundle
+  or stdout/stderr). Front end: 25 vitest + testing-library tests (SSE parser,
+  `useChat` stream → stop → retry, capability-gated settings, connect flow).
+- `evidence/live_session.py` drives the real `--serve` against the mock and a live
+  React session (jsdom + real fetch) end to end.
+- README gains the Web UI section (two-command build, security model, v0.7.1
+  boundary); version bumped to 0.7.0 everywhere it lives.
+
+### Not in this release (v0.7.1)
+
+Session list/save/load/branching, tool and MCP visibility, Markdown/code highlighting,
+UI export, image input.
 
 ## v0.6.0 — 2026-09-27
 

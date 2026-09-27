@@ -27,7 +27,7 @@ import time
 from .errors import BonsaiError
 
 PROTOCOL_VERSION = '2024-11-05'
-CLIENT_INFO = {'name': 'bonsai-kit', 'version': '0.6.0'}
+CLIENT_INFO = {'name': 'bonsai-kit', 'version': '0.7.0'}
 
 
 class McpError(BonsaiError):

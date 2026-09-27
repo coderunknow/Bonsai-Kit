@@ -74,8 +74,8 @@ class HappyPathTests(CellRunTestCase):
         mode = (self.run.root / 'state.json').stat().st_mode & 0o777
         self.assertEqual(mode, 0o600)
         diag = self.run.diagnostics
-        self.assertEqual(diag['version'], '0.6.0')
-        self.assertEqual(diag['client_version'], '0.6.0')
+        self.assertEqual(diag['version'], '0.7.0')
+        self.assertEqual(diag['client_version'], '0.7.0')
         self.assertEqual(diag['model_params_b'], 27.36)
         self.assertTrue(diag['quantization_verified'])
         self.assertFalse(diag['speculative_decoding'])
@@ -95,7 +95,7 @@ class HappyPathTests(CellRunTestCase):
         beat = json.loads((self.run.root / 'heartbeat.json').read_text())
         self.assertEqual(beat['port'], self.run.state['port'])
         self.assertEqual(beat['public'], self.run.state['public'])
-        self.assertEqual(beat['version'], '0.6.0')
+        self.assertEqual(beat['version'], '0.7.0')
 
     def test_supervision_is_running_for_both_components(self):
         self.assert_ready()
